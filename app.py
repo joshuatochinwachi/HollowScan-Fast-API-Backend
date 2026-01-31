@@ -4,7 +4,7 @@ app.py
 Professional FastAPI backend for HollowScan Mobile App.
 Provides endpoints for feed, categories, and subscription management.
 """
-
+ 
 from fastapi import FastAPI, HTTPException, Depends, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 import requests
@@ -16,7 +16,11 @@ import string
 import random
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
 from supabase_utils import get_supabase_config, sanitize_text
+
+# Load environment variables first
+load_dotenv()
 
 app = FastAPI(title="HollowScan Mobile API", version="1.0.0")
 
@@ -251,29 +255,48 @@ async def get_categories():
     """
     result = {}
     channels = []
+    source = "none"
     
-    # Try remote channels.json
+    # Try remote channels.json from Supabase
     try:
+        storage_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        print(f"[CATEGORIES] Attempting remote fetch from: {storage_url[:50]}...")
         channels_response = requests.get(
-            f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json",
+            storage_url,
+            headers=HEADERS,
             timeout=10
         )
+        print(f"[CATEGORIES] Remote response status: {channels_response.status_code}")
         if channels_response.status_code == 200:
             channels = channels_response.json() or []
+            source = "remote"
+            print(f"[CATEGORIES] ✓ Loaded {len(channels)} channels from remote")
+        else:
+            print(f"[CATEGORIES] Remote request failed with status {channels_response.status_code}")
+            if channels_response.text:
+                print(f"[CATEGORIES] Response body: {channels_response.text[:200]}")
+    except requests.exceptions.Timeout:
+        print(f"[CATEGORIES] ✗ Remote channels fetch TIMEOUT (network issue)")
+    except requests.exceptions.ConnectionError:
+        print(f"[CATEGORIES] ✗ Remote channels fetch CONN ERROR (Supabase unreachable?)")
     except Exception as e:
-        print(f"[CATEGORIES] Remote channels fetch failed: {e}")
+        print(f"[CATEGORIES] ✗ Remote channels fetch failed: {type(e).__name__}: {e}")
     
     # Try local channels.json
     if not channels and os.path.exists("data/channels.json"):
         try:
             with open("data/channels.json", "r") as f:
                 channels = json.load(f)
+            source = "local"
+            print(f"[CATEGORIES] ✓ Loaded {len(channels)} channels from local file")
         except Exception as e:
-            print(f"[CATEGORIES] Local channels read failed: {e}")
+            print(f"[CATEGORIES] ✗ Local channels read failed: {e}")
     
     # If still no channels, use defaults
     if not channels:
         channels = DEFAULT_CHANNELS
+        source = "defaults"
+        print(f"[CATEGORIES] ⚠️ Using DEFAULT_CHANNELS ({len(channels)} channels) - this means Supabase is unreachable!")
     
     # Initialize regions
     result = {
@@ -307,32 +330,98 @@ async def get_categories():
         result[region] = sorted(result[region])
         result[region].insert(0, "ALL")  # Add ALL option at top
     
-    print(f"[CATEGORIES] Loaded categories: {result}")
-    return result
+    print(f"[CATEGORIES] ✓ Final categories from {source}: {result}")
+    return {"categories": result, "source": source, "channel_count": len(channels)}
+
+# Debug endpoint to check Supabase connectivity
+@app.get("/v1/debug/supabase")
+async def debug_supabase():
+    """Debug endpoint: Check Supabase connection and configuration"""
+    diagnostics = {
+        "supabase_url": URL[:30] + "..." if URL else "NOT SET",
+        "supabase_key_set": bool(KEY),
+        "env_vars_loaded": bool(URL and KEY),
+        "tests": {}
+    }
+    
+    # Test 1: Storage accessibility
+    try:
+        test_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        print(f"[DEBUG] Testing storage connectivity...")
+        response = requests.head(test_url, headers=HEADERS, timeout=5)
+        diagnostics["tests"]["storage_head_request"] = {
+            "status": response.status_code,
+            "ok": response.status_code < 400
+        }
+    except Exception as e:
+        diagnostics["tests"]["storage_head_request"] = {"error": str(e), "type": type(e).__name__}
+    
+    # Test 2: Fetch channels.json
+    try:
+        test_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        print(f"[DEBUG] Fetching channels.json...")
+        response = requests.get(test_url, headers=HEADERS, timeout=5)
+        diagnostics["tests"]["channels_json_get"] = {
+            "status": response.status_code,
+            "content_length": len(response.content),
+            "is_json": response.headers.get('content-type', '').startswith('application/json'),
+            "ok": response.status_code == 200
+        }
+        if response.status_code != 200:
+            diagnostics["tests"]["channels_json_get"]["error"] = response.text[:200]
+    except Exception as e:
+        diagnostics["tests"]["channels_json_get"] = {"error": str(e), "type": type(e).__name__}
+    
+    # Test 3: REST API accessibility (check users table)
+    try:
+        print(f"[DEBUG] Testing REST API...")
+        response = requests.get(
+            f"{URL}/rest/v1/users?limit=1",
+            headers=HEADERS,
+            timeout=5
+        )
+        diagnostics["tests"]["rest_api_users"] = {
+            "status": response.status_code,
+            "ok": response.status_code < 400
+        }
+    except Exception as e:
+        diagnostics["tests"]["rest_api_users"] = {"error": str(e), "type": type(e).__name__}
+    
+    return diagnostics
 
 # Debug endpoint to check channel-to-region mapping
 @app.get("/v1/debug/channels")
 async def debug_channels():
     """Debug endpoint: Show which region each channel is mapped to"""
     channels = []
+    channels_source = "unknown"
     
     try:
+        storage_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
         channels_response = requests.get(
-            f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json",
+            storage_url,
+            headers=HEADERS,
             timeout=10
         )
         if channels_response.status_code == 200:
             channels = channels_response.json() or []
-    except: pass
+            channels_source = "remote_success"
+        else:
+            channels_source = f"remote_failed_{channels_response.status_code}"
+    except Exception as e:
+        channels_source = f"remote_exception_{type(e).__name__}"
 
     if not channels and os.path.exists("data/channels.json"):
         try:
             with open("data/channels.json", "r") as f:
                 channels = json.load(f)
-        except: pass
+            channels_source = "local_file"
+        except Exception as e:
+            channels_source = f"local_file_failed_{type(e).__name__}"
 
     if not channels:
         channels = DEFAULT_CHANNELS
+        channels_source = "defaults"
 
     # Build mapping
     mapping = {"UK Stores": [], "USA Stores": [], "Canada Stores": []}
@@ -388,6 +477,7 @@ async def debug_channels():
     
     return {
         "total_channels": len(known_ids),
+        "channels_source": channels_source,
         "mapping": mapping,
         "unknown_regions": unknown,
         "orphaned_channel_ids": orphaned_detail
