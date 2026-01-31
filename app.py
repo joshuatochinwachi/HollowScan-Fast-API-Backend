@@ -257,9 +257,9 @@ async def get_categories():
     channels = []
     source = "none"
     
-    # Try remote channels.json from Supabase
+    # Try remote channels.json from Supabase (using authenticated access for private buckets)
     try:
-        storage_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        storage_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/channels.json"
         print(f"[CATEGORIES] Attempting remote fetch from: {storage_url[:50]}...")
         channels_response = requests.get(
             storage_url,
@@ -344,9 +344,9 @@ async def debug_supabase():
         "tests": {}
     }
     
-    # Test 1: Storage accessibility
+    # Test 1: Storage accessibility (authenticated)
     try:
-        test_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        test_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/channels.json"
         print(f"[DEBUG] Testing storage connectivity...")
         response = requests.head(test_url, headers=HEADERS, timeout=5)
         diagnostics["tests"]["storage_head_request"] = {
@@ -356,9 +356,9 @@ async def debug_supabase():
     except Exception as e:
         diagnostics["tests"]["storage_head_request"] = {"error": str(e), "type": type(e).__name__}
     
-    # Test 2: Fetch channels.json
+    # Test 2: Fetch channels.json (authenticated)
     try:
-        test_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        test_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/channels.json"
         print(f"[DEBUG] Fetching channels.json...")
         response = requests.get(test_url, headers=HEADERS, timeout=5)
         diagnostics["tests"]["channels_json_get"] = {
@@ -397,7 +397,7 @@ async def debug_channels():
     channels_source = "unknown"
     
     try:
-        storage_url = f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json"
+        storage_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/channels.json"
         channels_response = requests.get(
             storage_url,
             headers=HEADERS,
