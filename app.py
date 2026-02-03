@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 app.py
-Professional FastAPI backend for HollowScan Mobile App.
+Professional FastAPI backend for hollowScan Mobile App.
 Provides endpoints for feed, categories, and subscription management.
 """
  
@@ -22,7 +22,7 @@ from supabase_utils import get_supabase_config, sanitize_text
 # Load environment variables first
 load_dotenv()
 
-app = FastAPI(title="HollowScan Mobile API", version="1.0.0")
+app = FastAPI(title="hollowScan Mobile API", version="1.0.0")
 
 # Enable CORS for mobile development
 app.add_middleware(
@@ -42,11 +42,18 @@ HEADERS = {
     'Content-Type': 'application/json'
 }
 
-# Mirrors telegram_bot.py initial_channels
+# Mirrors telegram_bot.py initial_channels - Expanded for all regions
 DEFAULT_CHANNELS = [
+    # UK
     {"id": "1367813504786108526", "name": "Collectors Amazon", "url": "https://discord.com/channels/653646362453213205/1367813504786108526", "category": "UK Stores", "enabled": True},
     {"id": "855164313006505994", "name": "Argos Instore", "url": "https://discord.com/channels/653646362453213205/855164313006505994", "category": "UK Stores", "enabled": True},
-    {"id": "864504557903937587", "name": "Restocks Online", "url": "https://discord.com/channels/653646362453213205/864504557903937587", "category": "UK Stores", "enabled": True}
+    {"id": "864504557903937587", "name": "Restocks Online", "url": "https://discord.com/channels/653646362453213205/864504557903937587", "category": "UK Stores", "enabled": True},
+    # USA
+    {"id": "1385348512681689118", "name": "Amazon", "category": "USA Stores", "enabled": True},
+    {"id": "1384205489679892540", "name": "Walmart", "category": "USA Stores", "enabled": True},
+    # Canada
+    {"id": "1391616295560155177", "name": "Pokemon Center", "category": "Canada Stores", "enabled": True},
+    {"id": "1406802285337776210", "name": "Hobbiesville", "category": "Canada Stores", "enabled": True}
 ]
 
 # -------------------
@@ -245,7 +252,7 @@ def get_user_from_db(user_id: str):
 
 @app.get("/")
 async def root():
-    return {"status": "online", "app": "HollowScan API", "v": "1.0.0"}
+    return {"status": "online", "app": "hollowScan API", "v": "1.0.0"}
 
 @app.get("/v1/categories")
 async def get_categories():
@@ -282,15 +289,15 @@ async def get_categories():
     except Exception as e:
         print(f"[CATEGORIES] ✗ Remote channels fetch failed: {type(e).__name__}: {e}")
     
-    # Try local channels.json
-    if not channels and os.path.exists("data/channels.json"):
-        try:
-            with open("data/channels.json", "r") as f:
-                channels = json.load(f)
-            source = "local"
-            print(f"[CATEGORIES] ✓ Loaded {len(channels)} channels from local file")
-        except Exception as e:
-            print(f"[CATEGORIES] ✗ Local channels read failed: {e}")
+    # Try local fallback with multiple common names
+    if not channels:
+        for filename in ["data/channels_.json", "data/channels.json", "channels.json"]:
+            if os.path.exists(filename):
+                try:
+                    with open(filename, "r") as f:
+                        channels = json.load(f)
+                    if channels: break
+                except: continue
     
     # If still no channels, use defaults
     if not channels:
@@ -314,10 +321,15 @@ async def get_categories():
         store_name = channel.get('name', 'Unknown')
         
         # Normalize region names
-        if 'UK' in region_name.upper():
+        upper_reg = region_name.upper()
+        if 'UK' in upper_reg:
             region_name = 'UK Stores'
-        elif 'CANADA' in region_name.upper() or region_name.upper().startswith('CA'):
+        elif 'CANADA' in upper_reg:
             region_name = 'Canada Stores'
+        elif 'USA' in upper_reg or 'UNITED STATES' in upper_reg or upper_reg.startswith('US'):
+            region_name = 'USA Stores'
+        elif upper_reg.startswith('CA') and ('STOR' in upper_reg or len(upper_reg) <= 3):
+             region_name = 'Canada Stores'
         else:
             region_name = 'USA Stores'
         
@@ -486,6 +498,18 @@ async def debug_channels():
 # -------------------
 # DEDUPLICATION HELPER (mirrors telegram_bot.py)
 # -------------------
+def _clean_text_for_sig(text: str) -> str:
+    """Standardize text for comparison by removing mentions, special chars, and extra space"""
+    if not text: return ""
+    # Remove Discord mentions <@...>, <@&...>, <#...>
+    text = re.sub(r'<@&?\d+>|<#\d+>', '', text)
+    # Remove specific tags like @Unfiltered Restocks or similar common mentions
+    text = re.sub(r'@[A-Za-z0-9_]+\b', '', text)
+    # Remove common separators
+    text = text.replace('|', '').replace('[', '').replace(']', '')
+    # Normalize whitespace and lowercase
+    return " ".join(text.lower().split()).strip()
+
 def _get_content_signature(msg: Dict) -> str:
     """Generate a signature for content-based deduplication (Retailer + Title + Price)"""
     try:
@@ -512,283 +536,380 @@ def _get_content_signature(msg: Dict) -> str:
         
         # 2. FALLBACK: Parse plain text content if embed data missing
         if not retailer or not title or not price:
-            # Pattern: "@Mention | Product Name | Retailer | Just restocked for £XX.XX"
+            # Pattern: "Product Name | Retailer | Just restocked for £XX.XX" (mentions removed by cleaner)
             if content and "|" in content:
                 parts = [p.strip() for p in content.split("|")]
-                if len(parts) >= 3:
-                    if not title and len(parts) > 1:
-                        title = parts[1]
-                    if not retailer and len(parts) > 2:
-                        retailer = parts[2]
-                    if not price:
-                        price_match = re.search(r'[£$€]\s*[\d,]+\.?\d*', content)
-                        if price_match:
-                            price = price_match.group(0)
+                if len(parts) >= 2:
+                    # Search for price anywhere in content first
+                    price_match = re.search(r'[£$€]\s*[\d,]+\.?\d*', content)
+                    if price_match: price = price_match.group(0)
+                    
+                    if not title: title = parts[0]
+                    if not retailer and len(parts) > 1: retailer = parts[1]
             
         # Final fallback for Argos or other specific keywords
         if not retailer and "Argos" in content:
             retailer = "Argos Instore"
+            
+        # Clean and hash
+        # Clean and hash
+        c_retailer = _clean_text_for_sig(retailer)
+        c_title = _clean_text_for_sig(title)
         
-        # Create raw signature and hash it
-        raw_sig = f"{retailer}|{title}|{price}".lower().strip()
+        # Aggressive cleaning: use only first 25 chars of title to catch similar restock variants
+        f_title = c_title[:25].strip()
         
-        # If everything is still empty, use content hash or ID
-        if raw_sig == "||":
+        # Price cleaning: extract raw number
+        num_match = re.search(r'[\d,]+\.?\d*', price)
+        c_price = num_match.group(0).replace(',', '') if num_match else price.strip()
+        
+        raw_sig = f"{c_retailer}|{f_title}|{c_price}"
+        
+        if len(raw_sig) < 8: # Too weak, fallback to content hash
             return hashlib.md5(content.encode()).hexdigest() if content else str(msg.get("id"))
             
         return hashlib.md5(raw_sig.encode()).hexdigest()
     except Exception as e:
         return str(msg.get("id"))
 
+def _clean_display_text(text: str) -> str:
+    """Clean text for display by removing mentions, IDs, and ugly separators"""
+    if not text: return ""
+    # Remove Discord mentions <@...>, <@&...>, <#...>
+    text = re.sub(r'<@&?\d+>|<#\d+>', '', text)
+    # Remove specific tags at start like @Unfiltered Restocks | 
+    text = re.sub(r'^[ \t]*@[A-Za-z0-9_ ]+([|:-]|$)', '', text)
+    # Remove any @word mentions
+    text = re.sub(r'@[A-Za-z0-9_]+\b', '', text)
+    # Strip common separators if they are left at start/end
+    text = text.strip().strip('|').strip(':').strip('-').strip()
+    return text
+
+# Helper for Feed and Alerts
+def extract_product(msg, channel_map):
+    raw = msg.get("raw_data", {})
+    embed = raw.get("embed") or {}
+    
+    # Get channel info
+    ch_id = str(msg.get("channel_id", ""))
+    ch_info = channel_map.get(ch_id)
+    if not ch_info: return None
+    
+    raw_region = ch_info.get('category', 'USA Stores').strip()
+    upper_reg = raw_region.upper()
+    if 'UK' in upper_reg: msg_region = 'UK Stores'
+    elif 'CANADA' in upper_reg: msg_region = 'Canada Stores'
+    else: msg_region = 'USA Stores'
+    
+    subcategory = ch_info.get('name', 'Unknown')
+    
+    # Extract and clean title
+    raw_title = embed.get("title") or msg.get("content", "")[:100] or "HollowScan Product"
+    title = _clean_display_text(raw_title)
+    if not title: title = "HollowScan Product"
+    
+    description = embed.get("description") or ""
+    if not description and msg.get("content"):
+        description = re.sub(r'<@&?\d+>', '', msg.get("content", "")).strip()
+        description = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1', description)
+
+    image = None
+    if embed.get("images"):
+        image = optimize_image_url(embed["images"][0])
+    elif embed.get("image") and isinstance(embed["image"], dict):
+        image = optimize_image_url(embed["image"].get("url"))
+    elif embed.get("thumbnail") and isinstance(embed["thumbnail"], dict):
+        image = optimize_image_url(embed["thumbnail"].get("url"))
+    elif raw.get("attachments"):
+        for att in raw["attachments"]:
+            if any(att.get("filename", "").lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.webp']):
+                image = att.get("url")
+                break
+    if not image and msg.get("content"):
+        img_match = re.search(r'(https?://[^\s]+(?:\.png|\.jpg|\.jpeg|\.webp))', msg["content"], re.IGNORECASE)
+        if img_match: image = img_match.group(1)
+
+    price, resell, roi = None, None, None
+    details = []
+    product_data_updates = {}
+    
+    if embed.get("fields"):
+        for field in embed["fields"]:
+            name = (field.get("name") or "").strip()
+            val = (field.get("value") or "").strip()
+            if not name or not val: continue
+            if "[" in val and "](" in val: continue
+            
+            name_lower = name.lower()
+            matches = re.findall(r'[\d,.]+', val)
+            num = matches[-1].replace(',', '') if matches else None
+            
+            is_redundant = False
+            if num:
+                if any(k in name_lower for k in ["price", "retail", "cost"]):
+                    if not price: 
+                        price = num
+                        if "~~" in val or "(" in val: product_data_updates["price_display"] = val
+                    is_redundant = True
+                elif any(k in name_lower for k in ["resell", "resale", "sell"]):
+                    if not resell: resell = num
+                    is_redundant = True
+                elif any(k in name_lower for k in ["roi", "profit"]):
+                    if not roi: roi = num
+                    is_redundant = True
+            details.append({"label": name, "value": val, "is_redundant": is_redundant})
+    
+    if not price:
+        search_text = (msg.get("content") or "") + " " + description
+        patterns = [r'[\$£€]\s*([\d,.]+)', r'(?:Now|Price|Retail|Cost):\s*([\d,.]+)', r'(?:\s|^)([\d]{1,4}\.[\d]{2})(?:\s|$)']
+        for p in patterns:
+            m = re.search(p, search_text, re.IGNORECASE)
+            if m:
+                price = m.group(1).replace(',', '')
+                break
+
+    all_links = embed.get("links") or []
+    categorized_links = {"buy": [], "ebay": [], "fba": [], "other": []}
+    primary_buy_url = None
+    
+    for link in all_links:
+        url, text = link.get('url', ''), (link.get('text') or 'Link').strip()
+        if not url: continue
+        link_obj = {"text": text, "url": url}
+        u_low, t_low = url.lower(), text.lower()
+        
+        if any(k in t_low or k in u_low for k in ['buy', 'shop', 'purchase', 'checkout', 'cart', 'link']):
+            categorized_links["buy"].append(link_obj)
+            if not primary_buy_url: primary_buy_url = url
+        elif any(k in t_low or k in u_low for k in ['sold', 'active', 'google', 'ebay']): categorized_links["ebay"].append(link_obj)
+        elif any(k in t_low or k in u_low for k in ['keepa', 'amazon', 'selleramp', 'fba', 'camel']): categorized_links["fba"].append(link_obj)
+        else: categorized_links["other"].append(link_obj)
+    
+    if not primary_buy_url and embed.get("fields"):
+         for field in embed["fields"]:
+             link_match = re.search(r'\[([^\]]+)\]\((https?://[^\)]+)\)', field.get("value", ""))
+             if link_match: primary_buy_url = link_match.group(2); break
+
+    product_data = {
+        "title": title[:100], "description": description[:500],
+        "image": image or "https://via.placeholder.com/400",
+        "price": price, "resell": resell, "roi": roi,
+        "buy_url": primary_buy_url or (all_links[0].get('url') if all_links else None),
+        "links": categorized_links, "details": details
+    }
+    product_data.update(product_data_updates)
+
+    return {
+        "id": str(msg.get("id")), "region": msg_region,
+        "category_name": subcategory, "product_data": product_data,
+        "created_at": msg.get("scraped_at"), "is_locked": False
+    }
+
 @app.get("/v1/feed")
 async def get_feed(
     user_id: str,
-    region: Optional[str] = None,
-    category: Optional[str] = None,
+    region: Optional[str] = "ALL",
+    category: Optional[str] = "ALL",
     offset: int = 0,
-    limit: int = 20
+    limit: int = 20,
+    country: Optional[str] = None,
+    search: Optional[str] = None
 ):
     """
-    Paginated feed of products from discord_messages.
-    
-    Parameters:
-    - region: "UK Stores", "USA Stores", or "Canada Stores"
-    - category: Store name (e.g., "Argos Instore", "ALL" for all stores in region)
+    Paginated feed of products with robust filtering and overfetching.
     """
-    import re
-    
-    # 1. Fetch more messages than needed (oversample for filtering)
-    fetch_limit = max(limit * 5, 100)
-    query = f"order=scraped_at.desc&offset={offset}&limit={fetch_limit}"
-    
-    response = requests.get(
-        f"{URL}/rest/v1/discord_messages?{query}",
-        headers=HEADERS,
-        timeout=15
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail="Failed to fetch messages")
+    # Alias country to region for backward compatibility with some client calls
+    if country and (not region or region == "ALL"):
+        region = country
         
-    messages = response.json()
-    
-    # 2. Fetch channel mapping
+    # 1. Fetch channel mapping
     channels = []
-    
     try:
-        channels_response = requests.get(
-            f"{URL}/storage/v1/object/public/monitor-data/discord_josh/channels.json",
-            timeout=10
-        )
+        storage_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/channels.json"
+        channels_response = requests.get(storage_url, headers=HEADERS, timeout=10)
         if channels_response.status_code == 200:
             channels = channels_response.json() or []
     except: pass
 
-    if not channels and os.path.exists("data/channels.json"):
-        try:
-            with open("data/channels.json", "r") as f:
-                channels = json.load(f)
-        except: pass
+    if not channels:
+        for filename in ["data/channels_.json", "data/channels.json", "channels.json"]:
+            if os.path.exists(filename):
+                try:
+                    with open(filename, "r") as f:
+                        channels = json.load(f)
+                    if channels: break
+                except: continue
 
     if not channels:
         channels = DEFAULT_CHANNELS
 
-    # Build channel map - prefer channels from JSON over defaults
-    channel_map = {}
+    # 2. Determine target channel IDs
+    target_ids = []
+    if region and region.strip().upper() != "ALL":
+        req_reg = region.strip().upper()
+        if 'UK' in req_reg: norm_reg = 'UK'
+        elif 'CANADA' in req_reg or 'CA' in req_reg: norm_reg = 'CANADA'
+        else: norm_reg = 'USA'
+
+        for c in channels:
+            c_cat = (c.get('category') or '').upper()
+            c_name = (c.get('name') or '').upper()
+            is_region_match = norm_reg in c_cat or (norm_reg == 'USA' and 'US' in c_cat)
+            
+            if category and category.strip().upper() != "ALL":
+                if is_region_match and c_name == category.strip().upper():
+                    target_ids.append(c['id'])
+            elif is_region_match:
+                target_ids.append(c['id'])
     
-    # First add channels from loaded JSON (takes priority)
+    id_filter = ""
+    if target_ids:
+        id_filter = f"&channel_id=in.({','.join(target_ids)})"
+
+    # Build channel map once
+    channel_map = {}
     for c in channels:
-        if c.get('enabled', True):  # Only include enabled channels
+        if c.get('enabled', True):
             channel_map[c['id']] = {
                 'category': c.get('category', 'USA Stores').strip(),
                 'name': c.get('name', 'Unknown').strip()
             }
-    
-    # Then add DEFAULT_CHANNELS only if not already in map
     for c in DEFAULT_CHANNELS:
         if c['id'] not in channel_map:
             channel_map[c['id']] = {
                 'category': c.get('category', 'USA Stores').strip(),
                 'name': c.get('name', 'Unknown').strip()
             }
-    
-    # 3. Transform messages into structured product cards
-    def extract_product(msg):
-        raw = msg.get("raw_data", {})
-        embed = raw.get("embed") or {}
-        
-        # Get channel info
-        ch_id = str(msg.get("channel_id", ""))
-        ch_info = channel_map.get(ch_id)
-        
-        # SKIP messages from unknown channels (not in channels.json)
-        if not ch_info:
-            print(f"[FEED] Skipping message {msg.get('id')} - channel {ch_id} not in map")
-            return None
-        
-        # Get full region name - use directly from channel category (already normalized)
-        raw_region = ch_info.get('category', 'USA Stores').strip()
-        
-        # Normalize region: ensure it's one of the exact 3 names
-        if raw_region == 'UK Stores' or 'UK' in raw_region.upper():
-            msg_region = 'UK Stores'
-        elif raw_region == 'Canada Stores' or 'CANADA' in raw_region.upper():
-            msg_region = 'Canada Stores'
-        elif raw_region == 'USA Stores' or 'USA' in raw_region.upper() or 'UNITED STATES' in raw_region.upper():
-            msg_region = 'USA Stores'
-        else:
-            # Default fallback - log this
-            print(f"[WARN] Unknown region in channel {ch_id}: '{raw_region}'")
-            msg_region = 'USA Stores'
-        
-        # Subcategory is the store name
-        subcategory = ch_info.get('name', 'Unknown')
-        
-        # Title
-        title = embed.get("title") or msg.get("content", "")[:50] or "HollowScan Product"
-        
-        # Image - OPTIMIZE for high resolution
-        image = None
-        if embed.get("images"):
-            image = optimize_image_url(embed["images"][0])
-        elif embed.get("thumbnail"):
-            image = optimize_image_url(embed["thumbnail"])
-        
-        # Prices & ROI from fields
-        price, resell, roi = None, None, None
-        
-        if embed.get("fields"):
-            for field in embed["fields"]:
-                name = (field.get("name") or "").lower()
-                val = field.get("value") or ""
-                
-                match = re.search(r'[\d,.]+', val)
-                num = match.group(0).replace(',', '') if match else None
-                
-                if num:
-                    if "price" in name or "retail" in name or "cost" in name:
-                        price = num
-                    elif "resell" in name or "resale" in name or "sell" in name:
-                        resell = num
-                    elif "roi" in name or "profit" in name:
-                        roi = num
-        
-        # FALLBACK: Try to extract price from message content
-        if not price:
-            content = msg.get("content") or ""
-            price_match = re.search(r'[\$£€]\s*([\d,.]+)', content)
-            if price_match:
-                price = price_match.group(1).replace(',', '')
-        
-        # Extract links
-        all_links = embed.get("links") or []
-        categorized_links = {"buy": [], "ebay": [], "fba": [], "other": []}
-        primary_buy_url = None
-        
-        ebay_keywords = ['sold', 'active', 'google', 'ebay']
-        fba_keywords = ['keepa', 'amazon', 'selleramp', 'fba', 'camel']
-        buy_keywords = ['buy', 'shop', 'purchase', 'checkout', 'cart', 'atc']
-        
-        for link in all_links:
-            url = link.get('url', '')
-            text = (link.get('text') or 'Link').strip()
-            if not url:
-                continue
-                
-            text_lower = text.lower()
-            url_lower = url.lower()
-            link_obj = {"text": text, "url": url}
-            
-            if any(kw in text_lower or kw in url_lower for kw in buy_keywords):
-                categorized_links["buy"].append(link_obj)
-                if not primary_buy_url:
-                    primary_buy_url = url
-            elif any(kw in text_lower or kw in url_lower for kw in ebay_keywords):
-                categorized_links["ebay"].append(link_obj)
-            elif any(kw in text_lower or kw in url_lower for kw in fba_keywords):
-                categorized_links["fba"].append(link_obj)
-            else:
-                categorized_links["other"].append(link_obj)
-        
-        # Fallback primary URL
-        if not primary_buy_url and all_links:
-            primary_buy_url = all_links[0].get('url')
-        
-        return {
-            "id": str(msg.get("id")),
-            "region": msg_region,
-            "store_name": subcategory,
-            "product_data": {
-                "title": title[:100],
-                "image": image or "https://via.placeholder.com/400",
-                "price": price,
-                "resell": resell,
-                "roi": roi,
-                "buy_url": primary_buy_url,
-                "links": categorized_links
-            },
-            "created_at": msg.get("scraped_at"),
-            "is_locked": False
-        }
-    
-    # 4. Process and filter with DEDUPLICATION
-    products = []
+
+    # 3. Quota enforcement (Check early to set scan depth)
+    premium_user = False
+    try:
+        user = get_user_from_db(user_id)
+        if user and user.get("subscription_status") == "active":
+            premium_user = True
+    except Exception as e:
+        print(f"[FEED] Quota check error: {e}")
+
+    # 4. Robust Fetch Loop
+    all_products = []
     seen_signatures = set()
+    current_sql_offset = offset
+    chunks_scanned = 0
     
-    for msg in messages:
-        try:
-            sig = _get_content_signature(msg)
-            if sig in seen_signatures:
-                continue
-            
-            product = extract_product(msg)
-            
-            # SKIP if product is None (unknown channel)
-            if not product:
-                continue
-            
-            # Skip products without a price
-            if not product["product_data"]["price"]:
-                continue
-            
-            # Apply region filter (if specified)
-            if region and region.strip() and region != "ALL":
-                # Normalize both sides for comparison
-                requested_region = region.strip()
-                product_region = product["region"].strip()
+    # Increase scan depth for free users vs premium, and even more for searches
+    base_max = 12 if premium_user else 6
+    # Deep scan: 8x depth for searches to find older products
+    max_chunks = base_max * 8 if search else base_max
+    
+    while len(all_products) < limit and chunks_scanned < max_chunks:
+        batch_limit = 50
+        query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}{id_filter}"
+        
+        # Add server-side search filter for efficiency if possible
+        if search and search.strip():
+            keywords = [k.strip() for k in search.split() if len(k.strip()) > 1]
+            if keywords:
+                # Search both content and the embed title inside JSONB raw_data
+                or_parts = []
+                for k in keywords:
+                    or_parts.append(f"content.ilike.*{k}*")
+                    or_parts.append(f"raw_data->embed->>title.ilike.*{k}*")
+                    or_parts.append(f"raw_data->embed->>description.ilike.*{k}*")
                 
-                if product_region != requested_region:
-                    continue
+                query += f"&or=({','.join(or_parts)})"
             
-            # Apply store filter (if specified and not ALL)
-            if category and category.strip() and category != "ALL":
-                if product["store_name"].upper().strip() != category.upper().strip():
-                    continue
+        try:
+            # Increase timeout for deep search
+            response = requests.get(f"{URL}/rest/v1/discord_messages?{query}", headers=HEADERS, timeout=20)
+            if response.status_code != 200: break
             
-            products.append(product)
-            seen_signatures.add(sig)
+            messages = response.json()
+            if not messages: break
             
+            for msg in messages:
+                sig = _get_content_signature(msg)
+                if sig in seen_signatures: continue
+                
+                product = extract_product(msg, channel_map)
+                if not product: continue
+                if not product["product_data"]["price"]: continue
+                
+                # Search Filter (In-memory verification)
+                if search and search.strip():
+                    search_keywords = [k.lower().strip() for k in search.split() if k.strip()]
+                    
+                    # Target fields for search
+                    title_low = product["product_data"]["title"].lower()
+                    desc_low = product["product_data"]["description"].lower()
+                    cat_low = product["category_name"].lower()
+                    ret_low = (product["product_data"].get("retailer") or "").lower()
+                    
+                    # Match if ANY keyword appears in ANY field
+                    match_found = False
+                    for kw in search_keywords:
+                        if kw in title_low or kw in desc_low or kw in cat_low or kw in ret_low:
+                            match_found = True
+                            break
+                    
+                    if not match_found: continue
+
+                # Double check region/cat filters in memory (Post-extraction)
+                if region and region.strip().upper() != "ALL":
+                    if product["region"].strip() != region.strip(): continue
+                if category and category.strip().upper() != "ALL":
+                    if product["category_name"].upper().strip() != category.upper().strip(): continue
+                
+                all_products.append(product)
+                seen_signatures.add(sig)
+                if len(all_products) >= limit: break
+                
+            current_sql_offset += len(messages)
+            chunks_scanned += 1
+            if len(messages) < batch_limit: break # End of database
         except Exception as e:
-            print(f"[FEED] Error processing message {msg.get('id')}: {e}")
-            continue
+            print(f"[FEED] Error in batch fetch: {e}")
+            break
+
+    # 5. Result Trimming for Free Tier
     
-    # Log what was returned
-    region_name = region or "ALL"
-    category_name = category or "ALL"
-    print(f"[FEED] Returned {len(products)} products for region='{region_name}' category='{category_name}'")
+    # If not premium, strictly limit total visible to 4 across all pages
+    if not premium_user:
+        # If offset is already 4 or more, don't return any more products
+        if offset >= 4:
+            return {
+                "products": [],
+                "next_offset": offset,
+                "has_more": False,
+                "is_premium": False,
+                "total_count": offset + len(all_products) # Hint for paywall
+            }
+        
+        # Limit this batch so total doesn't exceed 4
+        all_products = all_products[:4 - offset]
+        for product in all_products:
+            product["is_locked"] = False # Ensure the first 4 are always UNLOCKED
+
+    print(f"[FEED] Scan complete. Found {len(all_products)} products after scanning {current_sql_offset - offset} messages.")
     
-    # 5. Check user quota for free users
-    user = get_user_from_db(user_id)
-    is_premium = user.get("subscription_status") == "active" if user else False
-    
-    if not is_premium:
-        views_used = user.get("daily_free_alerts_viewed", 0) if user else 0
-        for i, product in enumerate(products):
-            if views_used + i >= 4:
-                product["is_locked"] = True
-                product["product_data"] = {"locked_message": "Subscribe to unlock"}
-    
-    return products
+    return {
+        "products": all_products,
+        "next_offset": current_sql_offset,
+        "has_more": premium_user and (len(all_products) >= limit),
+        "is_premium": premium_user,
+        "total_count": 100 # Static hint for "100+ more deals" or similar
+    }
+
+@app.get("/v1/feed_old")
+async def get_feed_legacy(
+    user_id: str,
+    region: Optional[str] = "ALL",
+    category: Optional[str] = "ALL",
+    offset: int = 0,
+    limit: int = 20
+):
+    # This remains for anyone still using the old array-only format if needed
+    result = await get_feed(user_id, region, category, offset, limit)
+    return result["products"]
 
 @app.get("/v1/alerts/{alert_id}")
 async def get_alert_detail(alert_id: str, user_id: str):
