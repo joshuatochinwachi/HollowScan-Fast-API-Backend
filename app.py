@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-app.py
+app.py - OPTIMIZED
 Professional FastAPI backend for hollowScan Mobile App.
 Performance optimized for mobile with connection pooling and async operations.
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Query, Header, Body, BackgroundTasks
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
@@ -77,11 +78,18 @@ LAST_PUSH_CHECK_TIME = datetime.now(timezone.utc)
 
 
 DEFAULT_CHANNELS = [
-    {"id": "1367813504786108526", "name": "Collectors Amazon", "url": "https://discord.com/channels/653646362453213205/1367813504786108526", "category": "UK Stores", "enabled": True},
-    {"id": "855164313006505994", "name": "Argos Instore", "url": "https://discord.com/channels/653646362453213205/855164313006505994", "category": "UK Stores", "enabled": True},
-    {"id": "864504557903937587", "name": "Restocks Online", "url": "https://discord.com/channels/653646362453213205/864504557903937587", "category": "UK Stores", "enabled": True},
+    {"id": "1367813504786108526", "name": "Collectors Amazon", "category": "UK Stores", "enabled": True},
+    {"id": "855164313006505994", "name": "Argos Instore", "category": "UK Stores", "enabled": True},
+    {"id": "864504557903937587", "name": "Restocks Online", "category": "UK Stores", "enabled": True},
+    {"id": "1394825979461111980", "name": "Chaos Cards", "category": "UK Stores", "enabled": True},
+    {"id": "1445485120231571730", "name": "Magic Madhouse", "category": "UK Stores", "enabled": True},
+    {"id": "1391616507406192701", "name": "Pokemon Center UK", "category": "UK Stores", "enabled": True},
+    {"id": "1445485873083711628", "name": "Smyths Toys", "category": "UK Stores", "enabled": True},
+    {"id": "1404906840118132928", "name": "Zaavi", "category": "UK Stores", "enabled": True},
+    {"id": "1404910797448286319", "name": "John Lewis", "category": "UK Stores", "enabled": True},
     {"id": "1385348512681689118", "name": "Amazon", "category": "USA Stores", "enabled": True},
     {"id": "1384205489679892540", "name": "Walmart", "category": "USA Stores", "enabled": True},
+    {"id": "1384205662023848018", "name": "Pokemon Center", "category": "USA Stores", "enabled": True},
     {"id": "1391616295560155177", "name": "Pokemon Center", "category": "Canada Stores", "enabled": True},
     {"id": "1406802285337776210", "name": "Hobbiesville", "category": "Canada Stores", "enabled": True}
 ]
@@ -170,9 +178,9 @@ async def send_email_via_resend(to_email: str, subject: str, html_content: str):
         "Authorization": f"Bearer {RESEND_API_KEY}",
         "Content-Type": "application/json"
     }
-    # For Resend free accounts without a domain, only onboarding@resend.dev works
+    # Professional sender address using verified domain
     payload = {
-        "from": "hollowScan <onboarding@resend.dev>",
+        "from": "hollowScan <no-reply@hollowscan.com>",
         "to": [to_email],
         "subject": subject,
         "html": html_content
@@ -226,31 +234,55 @@ async def delete_verification_code_from_supabase(email: str) -> bool:
         print(f"[DB] Error deleting verification code: {e}")
     return False
 
-async def trigger_email_verification(email: str):
-    code = generate_verification_code()
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
-    
-    success = await upsert_verification_code_to_supabase(email, code, expires_at)
-    if not success:
-        print(f"[AUTH] Failed to save verification code for {email} to Supabase")
-        return False
-    
-    html = f"""
-    <div style="font-family: sans-serif; padding: 20px; color: #333; max-width: 500px; margin: auto; border: 1px solid #eee; border-radius: 12px;">
-        <h2 style="color: #007AFF; text-align: center;">Verify Your Email</h2>
-        <p>Welcome to <b>hollowScan</b>! Use the code below to verify your email address and unlock all features:</p>
-        <div style="background: #F2F2F7; padding: 20px; border-radius: 12px; font-size: 32px; font-weight: 800; text-align: center; letter-spacing: 10px; color: #1C1C1E; margin: 20px 0;">
-            {code}
-        </div>
-        <p style="font-size: 14px; color: #8E8E93; text-align: center;">This code will expire in 24 hours.</p>
-        <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
-        <p style="font-size: 12px; color: #AEAEB2; text-align: center;">If you didn't create an account, you can safely ignore this email.</p>
-    </div>
+async def trigger_email_verification(email: str, force: bool = False):
     """
-    return await send_email_via_resend(email, f"{code} is your hollowScan verification code", html)
+    Triggers a verification email with cooldown logic.
+    force=True bypasses the cooldown (used for manual resends with their own check).
+    """
+    try:
+        # 1. Cooldown Check (60 seconds)
+        if not force:
+            stored = await get_verification_code_from_supabase(email)
+            if stored:
+                last_sent = safe_parse_dt(stored.get("created_at"))
+                if last_sent:
+                    elapsed = (datetime.now(timezone.utc) - last_sent).total_seconds()
+                    if elapsed < 60:
+                        print(f"[AUTH] Cooldown skip for {email} ({int(elapsed)}s elapsed)")
+                        return False
+
+        # 2. Generate and Save Code
+        code = generate_verification_code()
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        
+        success = await upsert_verification_code_to_supabase(email, code, expires_at)
+        if not success:
+            print(f"[AUTH] Failed to save verification code for {email}")
+            return False
+        
+        # 3. Send Email
+        html = f"""
+        <div style="font-family: sans-serif; padding: 20px; color: #333; max-width: 500px; margin: auto; border: 1px solid #eee; border-radius: 12px;">
+            <h2 style="color: #007AFF; text-align: center;">Verify Your Email</h2>
+            <p>Welcome to <b>hollowScan</b>! Use the code below to verify your email address and unlock all features:</p>
+            <div style="background: #F2F2F7; padding: 20px; border-radius: 12px; font-size: 32px; font-weight: 800; text-align: center; letter-spacing: 10px; color: #1C1C1E; margin: 20px 0;">
+                {code}
+            </div>
+            <p style="font-size: 14px; color: #8E8E93; text-align: center;">This code will expire in 24 hours.</p>
+            <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+            <p style="font-size: 12px; color: #AEAEB2; text-align: center;">If you didn't create an account, you can safely ignore this email.</p>
+        </div>
+        """
+        sent = await send_email_via_resend(email, f"{code} is your hollowScan verification code", html)
+        if sent:
+            print(f"[AUTH] Verification email sent to {email}")
+        return sent
+    except Exception as e:
+        print(f"[AUTH] Error in trigger_email_verification: {e}")
+        return False
 
 @app.post("/v1/auth/signup")
-async def signup(data: Dict = Body(...)):
+async def signup(background_tasks: BackgroundTasks, data: Dict = Body(...)):
     email = data.get("email")
     password = data.get("password")
     if not email or not password: raise HTTPException(status_code=400, detail="Email and password are required")
@@ -262,8 +294,8 @@ async def signup(data: Dict = Body(...)):
         response = await http_client.post(f"{URL}/rest/v1/users", headers=HEADERS, json=payload)
         if response.status_code in [200, 201]:
             user = response.json()[0] if isinstance(response.json(), list) else response.json()
-            # Trigger verification email
-            await trigger_email_verification(email)
+            # Trigger verification email in background
+            background_tasks.add_task(trigger_email_verification, email)
             return {"success": True, "user": {"id": user["id"], "email": user["email"], "isPremium": user.get("subscription_status") == "active", "email_verified": False}}
 
         else: raise HTTPException(status_code=500, detail="Failed to create user")
@@ -273,21 +305,22 @@ async def signup(data: Dict = Body(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/auth/resend-code")
-async def resend_code(data: Dict = Body(...)):
+async def resend_code(background_tasks: BackgroundTasks, data: Dict = Body(...)):
     email = data.get("email")
     if not email: raise HTTPException(status_code=400, detail="Email is required")
     
-    # Cooldown check (60 seconds)
+    # Check cooldown explicitly here to provide user feedback
     stored = await get_verification_code_from_supabase(email)
     if stored:
-        last_sent = datetime.fromisoformat(stored["created_at"].replace('Z', '+00:00'))
-        elapsed = (datetime.now(timezone.utc) - last_sent).total_seconds()
-        if elapsed < 60:
-            remaining = int(60 - elapsed)
-            raise HTTPException(status_code=429, detail=f"Please wait {remaining} seconds before resending.")
+        last_sent = safe_parse_dt(stored.get("created_at"))
+        if last_sent:
+            elapsed = (datetime.now(timezone.utc) - last_sent).total_seconds()
+            if elapsed < 60:
+                remaining = int(60 - elapsed)
+                raise HTTPException(status_code=429, detail=f"Please wait {remaining} seconds before resending.")
             
-    success = await trigger_email_verification(email)
-    if not success: raise HTTPException(status_code=500, detail="Failed to send verification email")
+    # Trigger verification email in background (force=True since we did the check above)
+    background_tasks.add_task(trigger_email_verification, email, force=True)
     return {"success": True, "message": "Verification code sent! Please check your inbox."}
 
 @app.post("/v1/auth/verify-code")
@@ -409,6 +442,32 @@ async def register_push_token(user_id: str = Query(...), token: str = Query(...)
             current_tokens.append(token)
             await update_user(user_id, {"push_tokens": current_tokens})
             print(f"[PUSH] Registered token for user {user_id} in DB")
+            
+    return {"success": True}
+
+@app.delete("/v1/user/push-token")
+async def unregister_push_token(user_id: str = Query(...), token: str = Query(...)):
+    """Unregister a push token for a user (on logout)"""
+    if not user_id or not token: raise HTTPException(status_code=400, detail="User ID and token are required")
+    
+    # 1. Update local cache
+    if user_id in USER_PUSH_TOKENS and token in USER_PUSH_TOKENS[user_id]:
+        USER_PUSH_TOKENS[user_id].remove(token)
+        try:
+            with open("data/push_tokens.json", "w") as f:
+                json.dump(USER_PUSH_TOKENS, f)
+        except: pass
+        print(f"[PUSH] Unregistered token for user {user_id} in local cache")
+
+    # 2. Update Supabase
+    user = await get_user_by_id(user_id)
+    if user:
+        current_tokens = user.get("push_tokens") or []
+        if not isinstance(current_tokens, list): current_tokens = []
+        if token in current_tokens:
+            current_tokens.remove(token)
+            await update_user(user_id, {"push_tokens": current_tokens})
+            print(f"[PUSH] Unregistered token for user {user_id} in DB")
             
     return {"success": True}
 
@@ -600,15 +659,72 @@ async def link_telegram_endpoint(data: Dict = Body(...)):
         success = await link_telegram_account(user_id, telegram_id)
         
         if success:
-            # 3. Consume Token (Delete it)
+            # 3. Check for Premium to sync
+            bot_users = await get_bot_users_data()
+            user_data = bot_users.get(str(telegram_id), {})
+            expiry_str = user_data.get("expiry")
+            is_premium_telegram = False
+            
+            if expiry_str:
+                try:
+                    expiry_dt = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                    if expiry_dt.tzinfo is None: expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+                    if expiry_dt > datetime.now(timezone.utc):
+                        is_premium_telegram = True
+                except: pass
+            
+            if is_premium_telegram:
+                await update_user(user_id, {
+                    "subscription_status": "active",
+                    "subscription_end": expiry_str,
+                    "subscription_source": "telegram"
+                })
+                print(f"[LINK] Synced premium status for user {user_id} from Telegram {telegram_id}")
+
+            # 4. Consume Token (Delete it)
             await http_client.delete(f"{URL}/rest/v1/telegram_link_tokens?token=eq.{token}", headers=HEADERS)
-            return {"success": True, "message": "Account linked successfully"}
+            return {"success": True, "message": "Account linked successfully" + (" and premium status synced!" if is_premium_telegram else "")}
         else:
             return {"success": False, "message": "Failed to create link"}
             
     except Exception as e:
         print(f"[LINK] Error linking: {e}")
         return {"success": False, "message": str(e)}
+
+@app.get("/v1/user/telegram/redirect", response_class=HTMLResponse)
+async def telegram_redirect_page(code: str = Query(...)):
+    """A helper page to redirect from Telegram to the Mobile App"""
+    # This page solves the 'unsupported protocol' error in Telegram buttons
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Connecting to hollowScan...</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: -apple-system, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #0A0A0B; color: white; text-align: center; padding: 20px; }}
+            .loader {{ border: 4px solid #1C1C1E; border-top: 4px solid #4F46E5; border-radius: 50%; width: 40px; height: 40px; animation: spin 2s linear infinite; margin-bottom: 20px; }}
+            @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
+            .btn {{ display: inline-block; padding: 12px 24px; background: #4F46E5; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; margin-top: 20px; text-transform: uppercase; letter-spacing: 1px; }}
+        </style>
+    </head>
+    <body>
+        <div class="loader"></div>
+        <h2 style="margin: 0;">Linking your account...</h2>
+        <p style="color: #9CA3AF; margin-top: 8px;">If you are not redirected automatically, tap the button below.</p>
+        <a href="hollowscan://link?code={code}" class="btn">Open hollowScan</a>
+        <script>
+            // Attempt automatic redirect
+            window.location.href = "hollowscan://link?code={code}";
+            // Fallback for some browsers: if they stay on page for 3 seconds
+            setTimeout(function() {{
+                window.location.href = "hollowscan://link?code={code}";
+            }}, 2000);
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.post("/v1/user/telegram/unlink")
 async def unlink_telegram_endpoint(data: Dict = Body(...)):
@@ -702,7 +818,13 @@ async def background_notification_worker():
                         except: pass
                         
                         final_title = f"{prefix}: {title}"
-                        body = f"New drop in {msg_region}! Tap to grab this deal before it sells out."
+                        
+                        # Enhanced informative body
+                        price_info = f"Price: ${raw_now}" if raw_now else "Check Price"
+                        if raw_was and raw_was != raw_now:
+                            price_info += f" (Market: ${raw_was})"
+                            
+                        body = f"{product_data.get('title', 'View Deal')} | {price_info} | {msg_region}"
                         
                         # Target specific users based on preferences
                         target_tokens = []
@@ -731,13 +853,13 @@ async def background_notification_worker():
                             print(f"[PUSH] Sending to {len(set(target_tokens))} devices...")
                             await send_expo_push_notification(list(set(target_tokens)), final_title, body, {"product_id": msg["id"]})
                     
-                    LAST_PUSH_CHECK_TIME = now
+                    LAST_PUSH_CHECK_TIME = datetime.now(timezone.utc)
         except Exception as e:
             print(f"[PUSH] Worker error: {e}")
 
 
 @app.post("/v1/auth/login")
-async def login(data: Dict = Body(...)):
+async def login(background_tasks: BackgroundTasks, data: Dict = Body(...)):
     email = data.get("email")
     password = data.get("password")
     if not email or not password: raise HTTPException(status_code=400, detail="Email and password are required")
@@ -746,6 +868,12 @@ async def login(data: Dict = Body(...)):
     stored_hash = user.get("password_hash")
     if not stored_hash or stored_hash != hash_password(password): raise HTTPException(status_code=401, detail="Invalid email or password")
     
+    # AUTO-TRIGGER verification if not verified
+    is_verified = user.get("email_verified", False)
+    if not is_verified:
+        print(f"[AUTH] Unverified login for {email}, triggering background code")
+        background_tasks.add_task(trigger_email_verification, email)
+
     return {
         "success": True, 
         "user": {
@@ -753,7 +881,7 @@ async def login(data: Dict = Body(...)):
             "email": user["email"], 
             "isPremium": user.get("subscription_status") == "active", 
             "subscriptionEnd": user.get("subscription_end"),
-            "email_verified": user.get("email_verified", False)
+            "email_verified": is_verified
         }
     }
 
@@ -807,10 +935,14 @@ def _get_content_signature(msg: Dict) -> str:
         if not retailer and "Argos" in content: retailer = "Argos Instore"
         c_retailer = _clean_text_for_sig(retailer)
         c_title = _clean_text_for_sig(title)
-        f_title = c_title[:25].strip()
+        # Increase length to 60 and add a snippet of description for better uniqueness
+        f_title = c_title[:60].strip()
+        desc_snippet = _clean_text_for_sig(embed.get("description", ""))[:15]
+        
         num_match = re.search(r'[\d,]+\.?\d*', price)
         c_price = num_match.group(0).replace(',', '') if num_match else price.strip()
-        raw_sig = f"{c_retailer}|{f_title}|{c_price}"
+        
+        raw_sig = f"{c_retailer}|{f_title}|{c_price}|{desc_snippet}"
         if len(raw_sig) < 8: return hashlib.md5(content.encode()).hexdigest() if content else str(msg.get("id"))
         return hashlib.md5(raw_sig.encode()).hexdigest()
     except: return str(msg.get("id"))
@@ -829,47 +961,64 @@ def extract_product(msg, channel_map):
     embed = raw.get("embed") or (embeds[0] if embeds else {})
     ch_id = str(msg.get("channel_id", ""))
     ch_info = channel_map.get(ch_id)
-    if not ch_info: return None
+    if not ch_info:
+        # Fallback: Try to guess or use default instead of returning None
+        ch_info = {"name": "HollowScan Deal", "category": "USA Stores"}
+        # If it's a known UK ID prefix or content has £, suggest UK
+        content = msg.get("content", "")
+        if "£" in content or "chaos" in content.lower():
+            ch_info["category"] = "UK Stores"
+
     raw_region = ch_info.get('category', 'USA Stores').strip()
     upper_reg = raw_region.upper()
     if 'UK' in upper_reg: msg_region = 'UK Stores'
     elif 'CANADA' in upper_reg: msg_region = 'Canada Stores'
     else: msg_region = 'USA Stores'
+
     subcategory = ch_info.get('name', 'Unknown')
     raw_title = embed.get("title") or msg.get("content", "")[:100] or "HollowScan Product"
     title = _clean_display_text(raw_title)
     if not title: title = "HollowScan Product"
+
     description = embed.get("description") or ""
     if not description and msg.get("content"):
         description = re.sub(r'<@&?\d+>', '', msg.get("content", "")).strip()
         description = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1', description)
+
     image = None
     if embed.get("images"): image = optimize_image_url(embed["images"][0])
     elif embed.get("image") and isinstance(embed["image"], dict): image = optimize_image_url(embed["image"].get("url"))
     elif embed.get("thumbnail") and isinstance(embed["thumbnail"], dict): image = optimize_image_url(embed["thumbnail"].get("url"))
+
     if not image and embeds:
         for extra_embed in embeds:
             if extra_embed.get("images"): image = optimize_image_url(extra_embed["images"][0]); break
             elif extra_embed.get("image") and isinstance(extra_embed["image"], dict): image = optimize_image_url(extra_embed["image"].get("url")); break
             elif extra_embed.get("thumbnail") and isinstance(extra_embed["thumbnail"], dict): image = optimize_image_url(extra_embed["thumbnail"].get("url")); break
+
     if not image and raw.get("attachments"):
         for att in raw["attachments"]:
             if any(att.get("filename", "").lower().endswith(ext) for ext in ['.png', '.jpg', '.jpeg', '.webp']): image = att.get("url"); break
+
     if not image and msg.get("content"):
         img_match = re.search(r'(https?://[^\s]+(?:\.png|\.jpg|\.jpeg|\.webp))', msg["content"], re.IGNORECASE)
         if img_match: image = img_match.group(1)
+
     price, resell, roi, was_price = None, None, None, None
     details = []
     product_data_updates = {}
+
     if embed.get("fields"):
         for field in embed["fields"]:
             name = (field.get("name") or "").strip()
             val = (field.get("value") or "").strip()
             if not name or not val: continue
             if "[" in val and "](" in val: continue
+
             name_lower = name.lower()
             matches = re.findall(r'[\d,.]+', val)
             num = matches[-1].replace(',', '') if matches else None
+
             is_redundant = False
             if num:
                 if any(k in name_lower for k in ["price", "retail", "cost"]):
@@ -886,27 +1035,44 @@ def extract_product(msg, channel_map):
                 elif any(k in name_lower for k in ["was", "before", "original"]):
                     if not was_price: was_price = num
                     is_redundant = True
+
             if not is_redundant: details.append({"label": name, "value": val})
+
     all_links = []
+    # 1. Title URL
     if embed.get("title_url"): all_links.append({"url": embed["title_url"], "text": "Link"})
+    
+    # 2. Field Markdown Links
     if embed.get("fields"):
         for field in embed["fields"]:
             val = field.get("value", "")
             matches = re.findall(r'\[([^\]]+)\]\((https?://[^\)]+)\)', val)
             for text, url in matches: all_links.append({"url": url, "text": text})
+
+    # 3. Dedicated Links Array (from archiver)
+    if embed.get("links"):
+        for link in embed["links"]:
+            l_url = link.get("url")
+            l_text = link.get("text") or "Link"
+            if l_url and l_url.startswith("http") and not any(x["url"] == l_url for x in all_links):
+                all_links.append({"url": l_url, "text": l_text})
+
     categorized_links = {"buy": [], "ebay": [], "fba": [], "other": []}
     primary_buy_url = None
+
     for link in all_links:
         url, text = link.get('url', ''), (link.get('text') or 'Link').strip()
         if not url: continue
         link_obj = {"text": text, "url": url}
         u_low, t_low = url.lower(), text.lower()
+
         if any(k in t_low or k in u_low for k in ['buy', 'shop', 'purchase', 'checkout', 'cart', 'link']):
             categorized_links["buy"].append(link_obj)
             if not primary_buy_url: primary_buy_url = url
         elif any(k in t_low or k in u_low for k in ['sold', 'active', 'google', 'ebay']): categorized_links["ebay"].append(link_obj)
         elif any(k in t_low or k in u_low for k in ['keepa', 'amazon', 'selleramp', 'fba', 'camel']): categorized_links["fba"].append(link_obj)
         else: categorized_links["other"].append(link_obj)
+
     components = raw.get("components", [])
     for comp_row in components:
         sub_comps = comp_row.get("components", [])
@@ -923,10 +1089,12 @@ def extract_product(msg, channel_map):
                 elif any(k in t_low or k in u_low for k in ['sold', 'active', 'google', 'ebay']): categorized_links["ebay"].append(link_obj)
                 elif any(k in t_low or k in u_low for k in ['keepa', 'amazon', 'selleramp', 'fba', 'camel']): categorized_links["fba"].append(link_obj)
                 else: categorized_links["other"].append(link_obj)
+
     if not primary_buy_url and embed.get("fields"):
          for field in embed["fields"]:
              link_match = re.search(r'\[([^\]]+)\]\((https?://[^\)]+)\)', field.get("value", ""))
              if link_match: primary_buy_url = link_match.group(2); break
+
     product_data = {
         "title": title[:100], "description": description[:500],
         "image": image or "https://via.placeholder.com/400",
@@ -936,6 +1104,7 @@ def extract_product(msg, channel_map):
     }
     product_data.update(product_data_updates)
     return {"id": str(msg.get("id")), "region": msg_region, "category_name": subcategory, "product_data": product_data, "created_at": msg.get("scraped_at"), "is_locked": False}
+
 
 @app.get("/")
 async def root():
@@ -1108,86 +1277,6 @@ async def get_user_status(user_id: str):
     }
 
 
-def generate_link_key() -> str:
-    chars = string.ascii_uppercase + string.digits
-    return ''.join(random.choice(chars) for _ in range(6))
-
-def load_pending_links() -> Dict:
-    links_file = "data/pending_telegram_links.json"
-    if os.path.exists(links_file):
-        try:
-            with open(links_file, 'r') as f: return json.load(f)
-        except Exception as e: print(f"[TELEGRAM] Error loading pending links: {e}")
-    return {}
-
-def save_pending_links(links: Dict) -> bool:
-    links_file = "data/pending_telegram_links.json"
-    try:
-        os.makedirs(os.path.dirname(links_file), exist_ok=True)
-        with open(links_file, 'w') as f: json.dump(links, f, indent=2)
-        return True
-    except Exception as e:
-        print(f"[TELEGRAM] Error saving pending links: {e}")
-        return False
-
-@app.post("/v1/user/telegram/generate-key")
-async def generate_telegram_link_key(user_id: str = Query(...)):
-    try:
-        user = await get_user_by_id(user_id)
-        if not user: raise HTTPException(status_code=404, detail="User not found")
-        link_key = generate_link_key()
-        pending_links = load_pending_links()
-        pending_links[link_key] = {"user_id": user_id, "created_at": datetime.now(timezone.utc).isoformat(), "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(), "used": False}
-        if not save_pending_links(pending_links): raise HTTPException(status_code=500, detail="Failed to save link key")
-        return {"success": True, "link_key": link_key, "message": f"Send this message to @Hollowscan_bot: /link {link_key}", "expires_in_minutes": 15}
-    except HTTPException: raise
-    except Exception as e:
-        print(f"[TELEGRAM] Error generating link key: {e}")
-        raise HTTPException(status_code=500, detail=f"Error generating link key: {str(e)}")
-
-@app.get("/v1/user/telegram/link-status")
-async def check_telegram_link_status(user_id: str = Query(...)):
-    try:
-        pending_links = load_pending_links()
-        for link_key, link_info in pending_links.items():
-            if link_info['user_id'] == user_id and link_info.get('used'):
-                telegram_links = await get_telegram_links_for_user(user_id)
-                if telegram_links:
-                    latest_link = telegram_links[-1]
-                    return {"success": True, "linked": True, "telegram_id": latest_link.get('telegram_id'), "telegram_username": latest_link.get('telegram_username'), "is_premium": latest_link.get('is_premium', False)}
-        return {"success": True, "linked": False, "message": "Waiting for you to send the link command to the Telegram bot"}
-    except Exception as e:
-        print(f"[TELEGRAM] Error checking link status: {e}")
-        raise HTTPException(status_code=500, detail=f"Error checking link status: {str(e)}")
-
-@app.post("/v1/user/telegram/link")
-async def link_telegram_account_endpoint(user_id: str = Query(...), telegram_chat_id: int = Query(...), telegram_username: str = Query(None)):
-    try:
-        user = await get_user_by_id(user_id)
-        if not user: raise HTTPException(status_code=404, detail="User not found")
-        telegram_users_path = "data/bot_users.json"
-        is_telegram_premium = False
-        telegram_expiry = None
-        if os.path.exists(telegram_users_path):
-            with open(telegram_users_path, 'r') as f:
-                telegram_users = json.load(f)
-                chat_id_str = str(telegram_chat_id)
-                telegram_user_data = telegram_users.get(chat_id_str, {})
-                if telegram_user_data and 'expiry' in telegram_user_data:
-                    try:
-                        expiry_date = datetime.fromisoformat(telegram_user_data['expiry'].replace('Z', '+00:00'))
-                        if expiry_date > datetime.now(timezone.utc):
-                            is_telegram_premium = True
-                            telegram_expiry = telegram_user_data['expiry']
-                    except Exception as e: print(f"[TELEGRAM] Error parsing expiry: {e}")
-        link_result = await link_telegram_account(user_id=user_id, telegram_id=str(telegram_chat_id), telegram_username=telegram_username)
-        if not link_result: raise HTTPException(status_code=500, detail="Failed to save Telegram link")
-        if is_telegram_premium: await update_user(user_id, {"subscription_status": "active", "subscription_end": telegram_expiry, "subscription_source": "telegram"})
-        return {"success": True, "message": "Telegram account linked" + (" and premium status synced!" if is_telegram_premium else ""), "is_premium": is_telegram_premium, "premium_until": telegram_expiry, "telegram_chat_id": telegram_chat_id, "telegram_username": telegram_username}
-    except HTTPException: raise
-    except Exception as e:
-        print(f"[TELEGRAM] Error linking account: {e}")
-        raise HTTPException(status_code=500, detail=f"Error linking Telegram account: {str(e)}")
 
 @app.get("/v1/deals/saved")
 async def get_saved_deals(user_id: str = Query(...)):
