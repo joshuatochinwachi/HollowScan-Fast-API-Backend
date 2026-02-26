@@ -3,3 +3,12 @@ uvicorn
 requests
 python-dotenv
 supabase
+
+httpx
+pydantic
+gunicorn
+
+# for security and authentication
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
