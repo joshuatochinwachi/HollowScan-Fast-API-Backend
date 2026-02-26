@@ -213,6 +213,43 @@ async def update_user(user_id: str, data: Dict, return_details: bool = False) ->
         return success, msg
     return success
 
+@db_retry(retries=3, backoff=2.0)
+async def delete_user_by_email(email: str) -> bool:
+    """Helper to delete a user and all related data by email"""
+    user = await get_user_by_email(email)
+    if not user:
+        return False
+    
+    user_id = user["id"]
+    
+    # 1. Delete from Supabase (Cascade handles user_telegram_links and saved_deals)
+    response = await http_client.delete(f"{URL}/rest/v1/users?id=eq.{user_id}", headers=HEADERS)
+    if response.status_code not in [200, 204]:
+        print(f"[DB] Delete user from Supabase failed: {response.status_code} {response.text}")
+        return False
+
+    # 2. Cleanup verification codes
+    await delete_verification_code_from_supabase(email)
+
+    # 3. Local Push Token Cleanup
+    if user_id in USER_PUSH_TOKENS:
+        del USER_PUSH_TOKENS[user_id]
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open("data/push_tokens.json", "w") as f:
+                json.dump(USER_PUSH_TOKENS, f)
+            print(f"[AUTH] Cleaned up push tokens for deleted user {user_id}")
+        except: pass
+
+    # 4. Cache Invalidation
+    try:
+        user_cache.invalidate(f"user_status:{user_id}")
+        user_cache.invalidate(f"user_profile:{user_id}")
+        print(f"[AUTH] Invalidated cache for deleted user {email}")
+    except: pass
+
+    return True
+
 async def verify_premium_status(user_id: str, user_data: Dict = None, background_tasks: BackgroundTasks = None) -> bool:
     """Strictly verify premium status, especially if source is Telegram"""
     try:
@@ -663,6 +700,22 @@ async def change_password(data: Dict = Body(...)):
         return {"success": True, "message": "Password updated successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to update password")
+
+@app.delete("/v1/user/account")
+async def delete_account(email: str = Query(...)):
+    """Delete a user account by email address"""
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+    
+    success = await delete_user_by_email(email)
+    if not success:
+        # Check if user exists first to provide better error
+        user = await get_user_by_email(email)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(status_code=500, detail="Failed to delete account")
+    
+    return {"success": True, "message": f"Account for {email} deleted successfully"}
 
 # Sends push notification via Expo Push API
 async def send_expo_push_notification(tokens: List[str], title: str, body: str, data: Dict = None):
