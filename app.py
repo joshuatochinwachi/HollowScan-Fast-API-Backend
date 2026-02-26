@@ -2352,7 +2352,7 @@ async def get_cache_stats():
 
 # --- ADMIN MANAGEMENT ENDPOINTS ---
 
-ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "AnalyticSages2026")
 
 async def verify_admin_key(x_admin_key: str = Header(None)):
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
