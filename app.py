@@ -2363,8 +2363,8 @@ async def debug_env():
         "key_preview": key[:4] + "..." if len(key) > 4 else "NOT SET"
     }
 
-async def verify_admin_key(x_admin_key: str = Header(None)):
-    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+async def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")):
+    if not x_admin_key or x_admin_key.strip() != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized admin access")
     return True
 
