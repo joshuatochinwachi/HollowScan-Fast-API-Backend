@@ -2354,15 +2354,6 @@ async def get_cache_stats():
 
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
-@app.get("/debug/env")
-async def debug_env():
-    key = os.getenv("ADMIN_API_KEY", "").strip()
-    return {
-        "key_set": bool(key),
-        "key_length": len(key),
-        "key_preview": key[:4] + "..." if len(key) > 4 else "NOT SET"
-    }
-
 async def verify_admin_key(x_admin_key: Optional[str] = Header(None, alias="x-admin-key")):
     if not x_admin_key or x_admin_key.strip() != ADMIN_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized admin access")
