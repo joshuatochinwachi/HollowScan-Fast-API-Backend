@@ -29,6 +29,7 @@ from functools import lru_cache
 from contextlib import asynccontextmanager
 
 from cache_utils import feed_cache, product_list_cache, user_cache, categories_cache
+from google_play_utils import verify_subscription
 
 
 # --- HELPER: Robust Timestamp Parsing ---
@@ -1185,10 +1186,20 @@ async def unlink_telegram_endpoint(data: Dict = Body(...)):
          raise HTTPException(status_code=400, detail="Missing user_id")
          
     try:
-        # 1. Delete Link from DB
+        # 1. Fetch telegram_id before unlinking to revoke premium in Bot JSON storage
+        links = await get_telegram_links_for_user(user_id)
+        if links:
+            telegram_id = links[0].get("telegram_id")
+            if telegram_id:
+                # Immediately revoke premium in Bot JSON (Expired Expiry)
+                past_expiry = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                await update_bot_user_premium(telegram_id, past_expiry)
+                print(f"[LINK] Revoked Telegram Bot premium for {telegram_id} due to app unlink")
+
+        # 2. Delete Link from DB
         response = await http_client.delete(f"{URL}/rest/v1/user_telegram_links?user_id=eq.{user_id}", headers=HEADERS)
         
-        # 2. Reset Premium Status if it was inherited from Telegram
+        # 3. Reset Premium Status if it was inherited from Telegram
         user = await get_user_by_id(user_id)
         if user and user.get("subscription_source") == "telegram" or (user and user.get("subscription_status") == "active" and user.get("subscription_source") == None):
              # Force reset if linked to Telegram even if source is missing (safety)
@@ -2515,6 +2526,98 @@ async def admin_get_analytics(admin_auth: bool = Depends(verify_admin_key)):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+# --- GOOGLE PLAY SUBSCRIPTION VERIFICATION & SYNC ---
+
+async def update_bot_user_premium(telegram_id: str, expiry_iso: str):
+    """
+    Syncs premium status to the Telegram bot by updating bot_users.json in Supabase Storage.
+    """
+    try:
+        # 1. Fetch current data
+        bot_users = await get_bot_users_data()
+        if not isinstance(bot_users, dict): bot_users = {}
+        
+        # 2. Update entry
+        bot_users[str(telegram_id)] = {
+            "expiry": expiry_iso,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "google_play"
+        }
+        
+        # 3. Upload back to Storage
+        file_content = json.dumps(bot_users, indent=2)
+        storage_url = f"{URL}/storage/v1/object/authenticated/{SUPABASE_BUCKET}/discord_josh/bot_users.json"
+        
+        # Include 'x-upsert' header for existing files
+        upload_headers = {**HEADERS, "x-upsert": "true"}
+        
+        resp = await http_client.post(storage_url, headers=upload_headers, content=file_content)
+        if resp.status_code in [200, 201]:
+            print(f"[SYNC] Successfully updated bot_users.json for telegram_id {telegram_id}")
+            # Refresh local cache
+            bot_users_cache["data"] = bot_users
+            bot_users_cache["last_fetched"] = time.time()
+            return True
+        else:
+            print(f"[SYNC] Failed to upload bot_users.json: {resp.status_code} {resp.text}")
+            return False
+    except Exception as e:
+        print(f"[SYNC] Error updating bot users: {e}")
+        return False
+
+async def sync_google_premium_to_telegram(user_id: str, expiry_iso: str):
+    """Helper to find linked telegram_id and sync status"""
+    links = await get_telegram_links_for_user(user_id)
+    if links:
+        telegram_id = links[0].get("telegram_id")
+        if telegram_id:
+            print(f"[SYNC] Syncing Google premium for user {user_id} to TG {telegram_id}")
+            await update_bot_user_premium(telegram_id, expiry_iso)
+
+@app.post("/v1/auth/google-play/verify")
+async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: Dict = Body(...)):
+    """
+    Verifies a Google Play purchase token and grants premium status.
+    Syncs to Telegram if linked.
+    """
+    user_id = data.get("user_id")
+    purchase_token = data.get("purchase_token")
+    product_id = data.get("product_id") # e.g. 'premium_monthly'
+    
+    if not all([user_id, purchase_token, product_id]):
+        raise HTTPException(status_code=400, detail="Missing required fields")
+        
+    # 1. Verify with Google
+    is_valid, expiry_iso, reason = await verify_subscription(purchase_token, product_id)
+    
+    if not is_valid:
+        print(f"[VERIFY] Invalid token for user {user_id}: {reason}")
+        raise HTTPException(status_code=400, detail=f"Verification failed: {reason}")
+        
+    # 2. Update Database
+    update_data = {
+        "subscription_status": "active",
+        "subscription_end": expiry_iso,
+        "subscription_source": "google"
+    }
+    
+    success = await update_user(user_id, update_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update user subscription status")
+        
+    # 3. Handle 2-Way Sync with Telegram in background
+    background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
+    
+    # Invalidate status cache
+    background_tasks.add_task(user_cache.invalidate, f"user_status:{user_id}")
+    
+    return {
+        "success": True,
+        "is_premium": True,
+        "subscription_end": expiry_iso,
+        "message": "Premium status activated!"
+    }
 
 # --- STATIC FRONTEND SERVING (ADMIN DASHBOARD) ---
 

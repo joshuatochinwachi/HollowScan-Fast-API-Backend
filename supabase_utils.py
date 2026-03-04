@@ -507,6 +507,53 @@ def link_app_user_to_telegram(user_id: str, telegram_id: str, telegram_username:
         if debug: print(f"❌ Link Exception: {e}")
         return {"success": False, "message": str(e)}
 
+def sync_telegram_premium_to_app(telegram_id: str, expiry_iso: str, debug: bool = True) -> bool:
+    """
+    Find the linked app user for a telegram ID and update their premium status.
+    Called by the Telegram bot after a successful Stripe payment.
+    """
+    url, key = get_supabase_config()
+    headers = {
+        'apikey': key,
+        'Authorization': f'Bearer {key}',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        # 1. Find linked user_id
+        check_resp = requests.get(
+            f"{url}/rest/v1/user_telegram_links?telegram_id=eq.{telegram_id}&select=user_id",
+            headers=headers,
+            timeout=10
+        )
+        if check_resp.status_code == 200:
+            existing = check_resp.json()
+            if existing:
+                user_id = existing[0]['user_id']
+                
+                # 2. Update users table
+                user_update = {
+                    "subscription_status": "active",
+                    "subscription_end": expiry_iso,
+                    "subscription_source": "telegram"
+                }
+                
+                patch_resp = requests.patch(
+                    f"{url}/rest/v1/users?id=eq.{user_id}",
+                    headers=headers,
+                    json=user_update,
+                    timeout=10
+                )
+                if patch_resp.status_code in [200, 204]:
+                    if debug: print(f"✅ Synced Stripe premium for Telegram {telegram_id} to App User {user_id}")
+                    return True
+                else:
+                    if debug: print(f"❌ Failed to update app user {user_id}: {patch_resp.text}")
+        return False
+    except Exception as e:
+        if debug: print(f"❌ Stripe Sync Error: {e}")
+        return False
+
 
 if __name__ == "__main__":
     print("Supabase Utils Loaded (Direct HTTP API Version)")

@@ -12,3 +12,7 @@ gunicorn
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
+
+# for Google Payments API
+google-auth
+google-api-python-client
