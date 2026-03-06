@@ -95,7 +95,7 @@ HEADERS = {'apikey': KEY, 'Authorization': f'Bearer {KEY}', 'Content-Type': 'app
 SUPABASE_BUCKET = "monitor-data"
 
 # Global storage for push tokens (Move to DB irl)
-USER_PUSH_TOKENS = {} # {user_id: [tokens]}
+# Push notification state management
 LAST_PUSH_CHECK_TIME = datetime.now(timezone.utc)
 RECENT_ALERTS_LOG = [] # [(signature, timestamp)] to prevent duplicate spam
 
@@ -239,17 +239,8 @@ async def delete_user_by_email(email: str) -> bool:
     # 2. Cleanup verification codes
     await delete_verification_code_from_supabase(email)
 
-    # 3. Local Push Token Cleanup
-    if user_id in USER_PUSH_TOKENS:
-        del USER_PUSH_TOKENS[user_id]
-        try:
-            os.makedirs("data", exist_ok=True)
-            with open("data/push_tokens.json", "w") as f:
-                json.dump(USER_PUSH_TOKENS, f)
-            print(f"[AUTH] Cleaned up push tokens for deleted user {user_id}")
-        except: pass
 
-    # 4. Cache Invalidation
+    # 3. Cache Invalidation
     try:
         user_cache.invalidate(f"user_status:{user_id}")
         user_cache.invalidate(f"user_profile:{user_id}")
@@ -625,59 +616,6 @@ async def reset_password(data: Dict = Body(...)):
     
     return {"success": True, "message": "Password updated successfully! You can now log in."}
 
-
-@app.post("/v1/user/push-token")
-async def register_push_token(user_id: str = Query(...), token: str = Query(...)):
-    if not user_id or not token: raise HTTPException(status_code=400, detail="User ID and token are required")
-    
-    # 1. Update local cache/file (fallback)
-    if user_id not in USER_PUSH_TOKENS: USER_PUSH_TOKENS[user_id] = []
-    if token not in USER_PUSH_TOKENS[user_id]:
-        USER_PUSH_TOKENS[user_id].append(token)
-        try:
-            os.makedirs("data", exist_ok=True)
-            with open("data/push_tokens.json", "w") as f:
-                json.dump(USER_PUSH_TOKENS, f)
-        except: pass
-    
-    # 2. Update Supabase (Primary)
-    # Fetch current tokens first
-    user = await get_user_by_id(user_id)
-    if user:
-        current_tokens = user.get("push_tokens") or []
-        if not isinstance(current_tokens, list): current_tokens = []
-        if token not in current_tokens:
-            current_tokens.append(token)
-            await update_user(user_id, {"push_tokens": current_tokens})
-            print(f"[PUSH] Registered token for user {user_id} in DB")
-            
-    return {"success": True}
-
-@app.delete("/v1/user/push-token")
-async def unregister_push_token(user_id: str = Query(...), token: str = Query(...)):
-    """Unregister a push token for a user (on logout)"""
-    if not user_id or not token: raise HTTPException(status_code=400, detail="User ID and token are required")
-    
-    # 1. Update local cache
-    if user_id in USER_PUSH_TOKENS and token in USER_PUSH_TOKENS[user_id]:
-        USER_PUSH_TOKENS[user_id].remove(token)
-        try:
-            with open("data/push_tokens.json", "w") as f:
-                json.dump(USER_PUSH_TOKENS, f)
-        except: pass
-        print(f"[PUSH] Unregistered token for user {user_id} in local cache")
-
-    # 2. Update Supabase
-    user = await get_user_by_id(user_id)
-    if user:
-        current_tokens = user.get("push_tokens") or []
-        if not isinstance(current_tokens, list): current_tokens = []
-        if token in current_tokens:
-            current_tokens.remove(token)
-            await update_user(user_id, {"push_tokens": current_tokens})
-            print(f"[PUSH] Unregistered token for user {user_id} in DB")
-            
-    return {"success": True}
 
 @app.post("/v1/user/change-password")
 async def change_password(data: Dict = Body(...)):
@@ -1336,27 +1274,20 @@ async def background_notification_worker():
                             region_label = region_raw.replace(" Stores", "").strip()
                             currency = "£" if "UK" in region_raw.upper() else "$"
                             
-                            discount_prefix = "🎉 "
+                            # Title: 🔥 Store - Region
+                            final_title = f"🔥 {store_label} - {region_label}"
+                            
+                            # Info: Profit or Discount
+                            info_tag = ""
                             if resell_val > price_val:
-                                discount_prefix = f"💰 {currency}{resell_val - price_val:.2f} Profit: "
+                                info_tag = f" {currency}{resell_val - price_val:.2f} Profit"
                             elif current_discount >= 5 and was_val > 0:
-                                discount_prefix = f"📉 {current_discount}% OFF: "
-
-                            final_title = f"{discount_prefix}{title_raw[:45]}..." if len(title_raw) > 45 else f"{discount_prefix}{title_raw}"
+                                info_tag = f" {current_discount}% OFF"
                             
-                            body_parts = []
-                            price_info = ""
-                            if price_val > 0:
-                                price_info = f"Now: {currency}{p_data['price']}"
-                                if was_val > price_val:
-                                    price_info += f" (Was {currency}{p_data['was_price']})"
-                            elif resell_val > 0:
-                                price_info = f"Resell: {currency}{p_data['resell']}"
-                            
-                            if price_info: body_parts.append(price_info)
-                            body_parts.append(f"Store: {store_label}")
-                            if region_label: body_parts.append(f"Reg: {region_label}")
-                            final_body = " | ".join(body_parts)
+                            # Body: Product Title • Price [Info]
+                            price_str = f"{currency}{p_data.get('price', '0.00')}"
+                            truncated_title = title_raw[:60] + "..." if len(title_raw) > 60 else title_raw
+                            final_body = f"{truncated_title} • {price_str}{info_tag}"
                             
                             await send_expo_push_notification(list(set(target_tokens)), final_title, final_body, {"product_id": str(msg_id), "image": p_data.get("image")})
                             
