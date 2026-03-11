@@ -2555,8 +2555,8 @@ async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: D
     # 3. Handle 2-Way Sync with Telegram in background
     background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
     
-    # Invalidate status cache
-    background_tasks.add_task(user_cache.invalidate, f"user_status:{user_id}")
+    # Invalidate status cache IMMEDIATELY (prevents race condition for app status check)
+    await user_cache.invalidate(f"user_status:{user_id}")
     
     return {
         "success": True,
