@@ -29,7 +29,7 @@ from functools import lru_cache
 from contextlib import asynccontextmanager
 
 from cache_utils import feed_cache, product_list_cache, user_cache, categories_cache
-from google_play_utils import verify_subscription
+from google_play_utils import verify_subscription, acknowledge_subscription
 
 
 # --- HELPER: Robust Timestamp Parsing ---
@@ -2545,6 +2545,12 @@ async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: D
     success = await update_user(user_id, update_data)
     if not success:
         raise HTTPException(status_code=500, detail="Failed to update user subscription status")
+        
+    # 2.5 Acknowledge with Google (STOPS AUTOMATIC REFUNDS)
+    ack_success, ack_reason = await acknowledge_subscription(purchase_token, product_id)
+    if not ack_success:
+        print(f"[GOOGLE] Warning: Acknowledgment failed for {user_id}: {ack_reason}")
+        # We don't raise error here because DB is already updated, but we log the warning
         
     # 3. Handle 2-Way Sync with Telegram in background
     background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
