@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 
 from cache_utils import feed_cache, product_list_cache, user_cache, categories_cache
 from google_play_utils import verify_subscription, acknowledge_subscription
+from apple_iap_utils import verify_apple_receipt
 
 
 # --- HELPER: Robust Timestamp Parsing ---
@@ -2563,6 +2564,51 @@ async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: D
         "is_premium": True,
         "subscription_end": expiry_iso,
         "message": "Premium status activated!"
+    }
+
+
+@app.post("/v1/auth/apple-iap/verify")
+async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dict = Body(...)):
+    """
+    Verifies an Apple In-App Purchase receipt and grants premium status.
+    Syncs to Telegram if linked. (iOS Exclusive)
+    """
+    user_id = data.get("user_id")
+    receipt_data = data.get("receipt_data")
+    product_id = data.get("product_id") # e.g. 'premium_monthly'
+    
+    if not all([user_id, receipt_data, product_id]):
+        raise HTTPException(status_code=400, detail="Missing required fields: user_id, receipt_data, product_id")
+        
+    # 1. Verify directly with Apple
+    is_valid, expiry_iso, reason = await verify_apple_receipt(receipt_data, product_id)
+    
+    if not is_valid:
+        print(f"[APPLE VERIFY] Invalid receipt for user {user_id}: {reason}")
+        raise HTTPException(status_code=400, detail=f"Verification failed: {reason}")
+        
+    # 2. Update Database with explicit "apple" source
+    update_data = {
+        "subscription_status": "active",
+        "subscription_end": expiry_iso,
+        "subscription_source": "apple"
+    }
+    
+    success = await update_user(user_id, update_data)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to update user subscription status")
+        
+    # 3. Handle 2-Way Sync with Telegram in background (Reusing identical logic)
+    background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
+    
+    # Invalidate status cache IMMEDIATELY (prevents race condition for app status check)
+    user_cache.invalidate(f"user_status:{user_id}")
+    
+    return {
+        "success": True,
+        "is_premium": True,
+        "subscription_end": expiry_iso,
+        "message": "Premium status activated via Apple!"
     }
 
 # --- STATIC FRONTEND SERVING (ADMIN DASHBOARD) ---
