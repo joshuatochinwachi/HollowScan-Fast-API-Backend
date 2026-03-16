@@ -2578,9 +2578,12 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
     product_id = data.get("product_id") # e.g. 'premium_monthly'
     
     # --- DEBUG LOGGING ---
+    receipt_str = str(receipt_data) if receipt_data else ""
     print(f"[APPLE DEBUG] Received verification request from user_id: {user_id}")
     print(f"[APPLE DEBUG] product_id: {product_id}")
-    print(f"[APPLE DEBUG] receipt_data length: {len(str(receipt_data)) if receipt_data else 0}")
+    print(f"[APPLE DEBUG] receipt_data length: {len(receipt_str)}")
+    if len(receipt_str) > 40:
+        print(f"[APPLE DEBUG] Receipt starts with: {receipt_str[:20]}... ends with: {receipt_str[-20:]}")
     print(f"[APPLE DEBUG] All keys in payload: {list(data.keys())}")
     
     if not all([user_id, receipt_data, product_id]):
@@ -2588,7 +2591,7 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
         raise HTTPException(status_code=400, detail="Missing required fields: user_id, receipt_data, product_id")
         
     # 1. Verify directly with Apple
-    is_valid, expiry_iso, reason = await verify_apple_receipt(receipt_data, product_id)
+    is_valid, expiry_iso, reason = await verify_apple_receipt(receipt_str.strip(), product_id)
     
     if not is_valid:
         print(f"[APPLE VERIFY] Invalid receipt for user {user_id}: {reason}")
