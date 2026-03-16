@@ -2577,7 +2577,14 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
     receipt_data = data.get("receipt_data")
     product_id = data.get("product_id") # e.g. 'premium_monthly'
     
+    # --- DEBUG LOGGING ---
+    print(f"[APPLE DEBUG] Received verification request from user_id: {user_id}")
+    print(f"[APPLE DEBUG] product_id: {product_id}")
+    print(f"[APPLE DEBUG] receipt_data length: {len(str(receipt_data)) if receipt_data else 0}")
+    print(f"[APPLE DEBUG] All keys in payload: {list(data.keys())}")
+    
     if not all([user_id, receipt_data, product_id]):
+        print(f"[APPLE DEBUG] 400 Bad Request: Missing fields. Payload: {data}")
         raise HTTPException(status_code=400, detail="Missing required fields: user_id, receipt_data, product_id")
         
     # 1. Verify directly with Apple
