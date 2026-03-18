@@ -2015,7 +2015,6 @@ async def share_product_page(product_id: str):
     desc = data.get("description", "Check out this deal on HollowScan!")
     img = data.get("image") or "https://hollowscan.com/icon.png"
     
-    # Robust price display for web
     price_val = data.get("price")
     currency = "£" if "UK" in prod.get("region", "") else "$"
     display_price = f"{currency}{price_val}" if price_val else "Check Price"
@@ -2023,7 +2022,9 @@ async def share_product_page(product_id: str):
     region = prod.get("region", "USA")
     deep_link = f"hollowscan://product/{product_id}"
 
-    # Construct HTML with premium feel and OG tags
+    PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=com.kttylabs.app"
+    APP_STORE_URL = "https://apps.apple.com/gb/app/hollowscan/id6759551811"
+
     html = f"""
     <!DOCTYPE html>
     <html lang="en">
@@ -2032,7 +2033,6 @@ async def share_product_page(product_id: str):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>{title} | HollowScan</title>
         
-        <!-- Open Graph / Social Previews -->
         <meta property="og:type" content="website">
         <meta property="og:title" content="{title}">
         <meta property="og:description" content="{desc[:150]}...">
@@ -2070,20 +2070,19 @@ async def share_product_page(product_id: str):
                 text-decoration: none; font-weight: 800;
                 padding: 16px 32px; border-radius: 14px;
                 display: block; transition: transform 0.2s;
-                font-size: 16px;
+                font-size: 16px; margin-bottom: 12px;
             }}
-            .btn:active {{ transform: scale(0.96); }}
+            .btn-store {{
+                background: rgba(255,255,255,0.06); color: #A1A1AA;
+                text-decoration: none; font-weight: 700;
+                padding: 14px 32px; border-radius: 14px;
+                display: block; font-size: 14px;
+                border: 1px solid rgba(255,255,255,0.08);
+            }}
+            .btn:active, .btn-store:active {{ transform: scale(0.96); }}
             .footer {{ margin-top: 32px; font-size: 12px; opacity: 0.5; }}
+            #status {{ font-size: 13px; color: #6B7280; margin-bottom: 16px; min-height: 20px; }}
         </style>
-        
-        <script>
-            // Auto-redirect to app
-            window.onload = function() {{
-                setTimeout(function() {{
-                    window.location.href = "{deep_link}";
-                }}, 500);
-            }};
-        </script>
     </head>
     <body>
         <div class="card">
@@ -2092,16 +2091,48 @@ async def share_product_page(product_id: str):
             </div>
             <h1>{title}</h1>
             <div class="price">{display_price}</div>
-            <a href="{deep_link}" class="btn">Open in HollowScan App</a>
+            <p id="status">Opening HollowScan...</p>
+            <a href="{deep_link}" class="btn" id="open-btn">Open in HollowScan App</a>
+            <a href="#" class="btn-store" id="store-btn" style="display:none;">📲 Download HollowScan</a>
             <div class="footer">
                 Shared via HollowScan Deals • {region}
             </div>
         </div>
+
+        <script>
+            var deepLink = "{deep_link}";
+            var playStore = "{PLAY_STORE_URL}";
+            var appStore = "{APP_STORE_URL}";
+            var ua = navigator.userAgent || navigator.vendor || window.opera;
+
+            var isAndroid = /android/i.test(ua);
+            var isIOS = /iphone|ipad|ipod/i.test(ua);
+
+            var storeUrl = isAndroid ? playStore : isIOS ? appStore : playStore;
+            var storeBtn = document.getElementById('store-btn');
+            storeBtn.href = storeUrl;
+
+            window.location.href = deepLink;
+
+            var fallbackTimer = setTimeout(function() {{
+                document.getElementById('status').textContent = "App not installed? Get it below 👇";
+                storeBtn.style.display = 'block';
+            }}, 2500);
+
+            document.addEventListener('visibilitychange', function() {{
+                if (document.hidden) {{
+                    clearTimeout(fallbackTimer);
+                }}
+            }});
+
+            window.addEventListener('blur', function() {{
+                clearTimeout(fallbackTimer);
+            }});
+        </script>
     </body>
     </html>
     """
     return html
-
 
 # ========================================
 # PUSH NOTIFICATION ENDPOINTS
