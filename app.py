@@ -2514,12 +2514,12 @@ async def update_bot_user_premium(telegram_id: str, expiry_iso: str):
         bot_users[str(telegram_id)] = {
             "expiry": expiry_iso,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "source": "google_play"
+            "source": "mobile_app"
         }
         
         # 3. Upload back to Storage
         file_content = json.dumps(bot_users, indent=2)
-        storage_url = f"{URL}/storage/v1/object/authenticated/{SUPABASE_BUCKET}/discord_josh/bot_users.json"
+        storage_url = f"{URL}/storage/v1/object/{SUPABASE_BUCKET}/discord_josh/bot_users.json"
         
         # Include 'x-upsert' header for existing files
         upload_headers = {**HEADERS, "x-upsert": "true"}
