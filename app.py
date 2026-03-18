@@ -1069,6 +1069,15 @@ async def link_telegram_endpoint(data: Dict = Body(...)):
                     "subscription_source": "telegram"
                 })
                 print(f"[LINK] Synced premium status for user {user_id} from Telegram {telegram_id}")
+            else:
+                # [Case B: App -> Bot] (Sync App premium to Telegram if it exists)
+                app_user = await get_user_by_id(user_id)
+                if app_user and app_user.get("subscription_status") == "active":
+                    app_expiry = app_user.get("subscription_end")
+                    app_source = app_user.get("subscription_source") or "mobile_app"
+                    if app_expiry:
+                        await update_bot_user_premium(telegram_id, app_expiry, app_source)
+                        print(f"[LINK] Synced premium status for Telegram {telegram_id} from App User {user_id}")
 
             # INVALIDATE CACHE
             user_cache.invalidate(f"user_status:{user_id}")
@@ -2501,7 +2510,7 @@ async def health_check():
 
 # --- GOOGLE PLAY SUBSCRIPTION VERIFICATION & SYNC ---
 
-async def update_bot_user_premium(telegram_id: str, expiry_iso: str):
+async def update_bot_user_premium(telegram_id: str, expiry_iso: str, source: str = "google_play"):
     """
     Syncs premium status to the Telegram bot by updating bot_users.json in Supabase Storage.
     """
@@ -2510,11 +2519,24 @@ async def update_bot_user_premium(telegram_id: str, expiry_iso: str):
         bot_users = await get_bot_users_data()
         if not isinstance(bot_users, dict): bot_users = {}
         
-        # 2. Update entry
+        # 2. Update entry (Use Naive UTC for bot compatibility)
+        # The bot's comparison logic requires naive datetimes (no +00:00 or Z suffixes)
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        
+        try:
+            # Cleanly handle any offset suffixes in incoming expiry string
+            expiry_raw = expiry_iso.replace("Z", "+00:00")
+            expiry_dt = datetime.fromisoformat(expiry_raw).replace(tzinfo=None)
+            expiry_naive = expiry_dt.isoformat()
+        except Exception:
+            # Safe fallback: strip common suffixes manually
+            expiry_naive = expiry_iso.replace("+00:00", "").replace("Z", "")
+
         bot_users[str(telegram_id)] = {
-            "expiry": expiry_iso,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "source": "mobile_app"
+            **bot_users.get(str(telegram_id), {}),
+            "expiry": expiry_naive,
+            "updated_at": now_naive.isoformat(),
+            "source": source
         }
         
         # 3. Upload back to Storage
@@ -2538,14 +2560,14 @@ async def update_bot_user_premium(telegram_id: str, expiry_iso: str):
         print(f"[SYNC] Error updating bot users: {e}")
         return False
 
-async def sync_google_premium_to_telegram(user_id: str, expiry_iso: str):
+async def sync_premium_to_telegram(user_id: str, expiry_iso: str, source: str = "google"):
     """Helper to find linked telegram_id and sync status"""
     links = await get_telegram_links_for_user(user_id)
     if links:
         telegram_id = links[0].get("telegram_id")
         if telegram_id:
-            print(f"[SYNC] Syncing Google premium for user {user_id} to TG {telegram_id}")
-            await update_bot_user_premium(telegram_id, expiry_iso)
+            print(f"[SYNC] Syncing {source} premium for user {user_id} to TG {telegram_id}")
+            await update_bot_user_premium(telegram_id, expiry_iso, source)
 
 @app.post("/v1/auth/google-play/verify")
 async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: Dict = Body(...)):
@@ -2585,7 +2607,7 @@ async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: D
         # We don't raise error here because DB is already updated, but we log the warning
         
     # 3. Handle 2-Way Sync with Telegram in background
-    background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
+    background_tasks.add_task(sync_premium_to_telegram, user_id, expiry_iso, "google")
     
     # Invalidate status cache IMMEDIATELY (prevents race condition for app status check)
     user_cache.invalidate(f"user_status:{user_id}")
@@ -2640,7 +2662,7 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
         raise HTTPException(status_code=500, detail="Failed to update user subscription status")
         
     # 3. Handle 2-Way Sync with Telegram in background (Reusing identical logic)
-    background_tasks.add_task(sync_google_premium_to_telegram, user_id, expiry_iso)
+    background_tasks.add_task(sync_premium_to_telegram, user_id, expiry_iso, "apple")
     
     # Invalidate status cache IMMEDIATELY (prevents race condition for app status check)
     user_cache.invalidate(f"user_status:{user_id}")
