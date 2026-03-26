@@ -2508,6 +2508,15 @@ async def admin_get_analytics(admin_auth: bool = Depends(verify_admin_key)):
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
+@app.get("/v1/announcement")
+async def get_announcement_data():
+    """
+    Returns the current global announcement message for the mobile app.
+    Controlled by APP_ANNOUNCEMENT environment variable.
+    """
+    msg = os.getenv("APP_ANNOUNCEMENT", "")
+    return {"message": msg}
+
 # --- GOOGLE PLAY SUBSCRIPTION VERIFICATION & SYNC ---
 
 async def update_bot_user_premium(telegram_id: str, expiry_iso: str, source: str = "google_play"):
