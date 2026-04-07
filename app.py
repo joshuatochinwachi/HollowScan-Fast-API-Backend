@@ -5,13 +5,14 @@ Professional FastAPI backend for hollowScan Mobile App.
 Performance optimized for mobile with connection pooling and async operations.
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, Body, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, Body, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
 import re
+import base64
 import time
 from collections import defaultdict
 
@@ -2602,7 +2603,8 @@ async def verify_google_play_purchase(background_tasks: BackgroundTasks, data: D
     update_data = {
         "subscription_status": "active",
         "subscription_end": expiry_iso,
-        "subscription_source": "google"
+        "subscription_source": "google",
+        "google_purchase_token": purchase_token
     }
     
     success = await update_user(user_id, update_data)
@@ -2653,7 +2655,7 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
         raise HTTPException(status_code=400, detail="Missing required fields: user_id, receipt_data, product_id")
         
     # 1. Verify directly with Apple
-    is_valid, expiry_iso, reason = await verify_apple_receipt(receipt_str.strip(), product_id)
+    is_valid, expiry_iso, reason, original_txn_id = await verify_apple_receipt(receipt_str.strip(), product_id)
     
     if not is_valid:
         print(f"[APPLE VERIFY] Invalid receipt for user {user_id}: {reason}")
@@ -2663,7 +2665,8 @@ async def verify_apple_iap_purchase(background_tasks: BackgroundTasks, data: Dic
     update_data = {
         "subscription_status": "active",
         "subscription_end": expiry_iso,
-        "subscription_source": "apple"
+        "subscription_source": "apple",
+        "apple_original_transaction_id": original_txn_id
     }
     
     success = await update_user(user_id, update_data)
@@ -2703,6 +2706,209 @@ if os.path.exists(ADMIN_DIST_DIR):
         return {"error": "Dashboard build not found"}
 else:
     print(f"[SERVER] Warning: Admin Dashboard dist folder not found at {ADMIN_DIST_DIR}")
+
+
+# ============================================================
+# APPLE SERVER-TO-SERVER NOTIFICATIONS (Auto-Renewal Webhook)
+# ============================================================
+
+@app.post("/v1/webhooks/apple")
+async def apple_webhook(background_tasks: BackgroundTasks, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ok"}
+
+    try:
+        import base64
+        signed_payload = body.get("signedPayload", "")
+        if not signed_payload:
+            return {"status": "ok"}
+
+        parts = signed_payload.split(".")
+        if len(parts) < 2:
+            return {"status": "ok"}
+
+        payload_b64 = parts[1]
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+
+        notification = json.loads(base64.urlsafe_b64decode(payload_b64))
+        notification_type = notification.get("notificationType", "")
+        data = notification.get("data", {})
+
+        print(f"[APPLE WEBHOOK] Received: {notification_type}")
+
+        signed_transaction = data.get("signedTransactionInfo", "")
+        transaction_info = {}
+        if signed_transaction:
+            parts3 = signed_transaction.split(".")
+            if len(parts3) >= 2:
+                b64 = parts3[1]
+                b64 += "=" * (4 - len(b64) % 4)
+                transaction_info = json.loads(base64.urlsafe_b64decode(b64))
+
+        original_transaction_id = transaction_info.get("originalTransactionId", "")
+        expires_ms = transaction_info.get("expiresDate", 0)
+        expiry_iso = None
+        if expires_ms:
+            expiry_iso = datetime.fromtimestamp(int(expires_ms) / 1000, tz=timezone.utc).isoformat()
+
+        user_data = None
+        if original_transaction_id:
+            resp = await http_client.get(
+                f"{URL}/rest/v1/users?apple_original_transaction_id=eq.{original_transaction_id}&select=*",
+                headers=HEADERS
+            )
+            if resp.status_code == 200 and resp.json():
+                user_data = resp.json()[0]
+
+        if not user_data:
+            print(f"[APPLE WEBHOOK] No user found for txn {original_transaction_id}. Skipping.")
+            return {"status": "ok"}
+
+        user_id = user_data["id"]
+
+        if notification_type in ("DID_RENEW", "SUBSCRIBED"):
+            if expiry_iso:
+                await update_user(user_id, {
+                    "subscription_status": "active",
+                    "subscription_end": expiry_iso,
+                    "subscription_source": "apple"
+                })
+                user_cache.invalidate(f"user_status:{user_id}")
+                background_tasks.add_task(sync_premium_to_telegram, user_id, expiry_iso, "apple")
+                print(f"[APPLE WEBHOOK] Renewed premium for user {user_id} until {expiry_iso}")
+
+        elif notification_type in ("EXPIRED", "REVOKED", "REFUND"):
+            await update_user(user_id, {
+                "subscription_status": "free",
+                "subscription_end": None,
+                "subscription_source": None
+            })
+            user_cache.invalidate(f"user_status:{user_id}")
+            links = await get_telegram_links_for_user(user_id)
+            if links:
+                telegram_id = links[0].get("telegram_id")
+                if telegram_id:
+                    past_expiry = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                    background_tasks.add_task(update_bot_user_premium, telegram_id, past_expiry, "apple_expired")
+            print(f"[APPLE WEBHOOK] Downgraded user {user_id} to free ({notification_type})")
+
+        elif notification_type == "DID_FAIL_TO_RENEW":
+            print(f"[APPLE WEBHOOK] Payment failed for user {user_id}. Grace period active.")
+
+        elif notification_type == "DID_CHANGE_RENEWAL_STATUS":
+            print(f"[APPLE WEBHOOK] User {user_id} changed renewal status.")
+
+    except Exception as e:
+        print(f"[APPLE WEBHOOK] Error: {e}")
+
+    return {"status": "ok"}
+
+
+# ============================================================
+# GOOGLE PLAY REAL-TIME DEVELOPER NOTIFICATIONS
+# ============================================================
+
+GOOGLE_NOTIFICATION_TYPES = {
+    1: "SUBSCRIPTION_RECOVERED",
+    2: "SUBSCRIPTION_RENEWED",
+    3: "SUBSCRIPTION_CANCELED",
+    4: "SUBSCRIPTION_PURCHASED",
+    5: "SUBSCRIPTION_ON_HOLD",
+    6: "SUBSCRIPTION_IN_GRACE_PERIOD",
+    7: "SUBSCRIPTION_RESTARTED",
+    12: "SUBSCRIPTION_REVOKED",
+    13: "SUBSCRIPTION_EXPIRED",
+}
+
+@app.post("/v1/webhooks/google")
+async def google_webhook(background_tasks: BackgroundTasks, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return {"status": "ok"}
+
+    try:
+        import base64
+        message = body.get("message", {})
+        encoded_data = message.get("data", "")
+        if not encoded_data:
+            return {"status": "ok"}
+
+        decoded = base64.b64decode(encoded_data).decode("utf-8")
+        notification = json.loads(decoded)
+
+        subscription_notification = notification.get("subscriptionNotification")
+        if not subscription_notification:
+            print("[GOOGLE WEBHOOK] Test ping or unrecognized format.")
+            return {"status": "ok"}
+
+        notification_type_int = subscription_notification.get("notificationType", 0)
+        purchase_token = subscription_notification.get("purchaseToken", "")
+        product_id = subscription_notification.get("subscriptionId", "")
+        notification_type_name = GOOGLE_NOTIFICATION_TYPES.get(notification_type_int, f"UNKNOWN_{notification_type_int}")
+
+        print(f"[GOOGLE WEBHOOK] Type: {notification_type_name}, product: {product_id}")
+
+        if not purchase_token or not product_id:
+            return {"status": "ok"}
+
+        user_data = None
+        resp = await http_client.get(
+            f"{URL}/rest/v1/users?google_purchase_token=eq.{purchase_token}&select=*",
+            headers=HEADERS
+        )
+        if resp.status_code == 200 and resp.json():
+            user_data = resp.json()[0]
+
+        if not user_data:
+            print(f"[GOOGLE WEBHOOK] No user found for token. Skipping {notification_type_name}.")
+            return {"status": "ok"}
+
+        user_id = user_data["id"]
+
+        if notification_type_int in (1, 2, 7):
+            is_valid, expiry_iso, reason = await verify_subscription(purchase_token, product_id)
+            if is_valid and expiry_iso:
+                await update_user(user_id, {
+                    "subscription_status": "active",
+                    "subscription_end": expiry_iso,
+                    "subscription_source": "google",
+                    "google_purchase_token": purchase_token
+                })
+                user_cache.invalidate(f"user_status:{user_id}")
+                background_tasks.add_task(sync_premium_to_telegram, user_id, expiry_iso, "google")
+                print(f"[GOOGLE WEBHOOK] Renewed premium for user {user_id} until {expiry_iso}")
+
+        elif notification_type_int in (5, 6):
+            print(f"[GOOGLE WEBHOOK] Payment issue for user {user_id}: {notification_type_name}. Grace period.")
+
+        elif notification_type_int in (12, 13):
+            await update_user(user_id, {
+                "subscription_status": "free",
+                "subscription_end": None,
+                "subscription_source": None
+            })
+            user_cache.invalidate(f"user_status:{user_id}")
+            links = await get_telegram_links_for_user(user_id)
+            if links:
+                telegram_id = links[0].get("telegram_id")
+                if telegram_id:
+                    past_expiry = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+                    background_tasks.add_task(update_bot_user_premium, telegram_id, past_expiry, "google_expired")
+            print(f"[GOOGLE WEBHOOK] Downgraded user {user_id} to free ({notification_type_name})")
+
+        elif notification_type_int == 3:
+            print(f"[GOOGLE WEBHOOK] User {user_id} cancelled. Still premium until expiry.")
+
+    except Exception as e:
+        print(f"[GOOGLE WEBHOOK] Error: {e}")
+
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn

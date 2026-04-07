@@ -8,13 +8,13 @@ APPLE_PRODUCTION_URL = "https://buy.itunes.apple.com/verifyReceipt"
 APPLE_SANDBOX_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
 
 
-async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool, Optional[str], str]:
+async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool, Optional[str], str, str]:
     """
     Verifies an Apple App Store receipt against Apple's servers.
     Automatically handles sandbox routing for test receipts.
 
     Returns:
-        Tuple[bool, Optional[str], str]: (is_valid, expiry_iso_string, reason/error_message)
+        Tuple[bool, Optional[str], str, str]: (is_valid, expiry_iso_string, reason/error_message, original_transaction_id)
     """
     shared_secret = os.getenv("APPLE_SHARED_SECRET")
     
@@ -22,7 +22,7 @@ async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool
     if not shared_secret:
         print("[APPLE VERIFY] WARNING: APPLE_SHARED_SECRET not set in environment.")
         # For auto-renewable subscriptions, the shared secret is strictly required by Apple.
-        return False, None, "Server configuration error: Missing APPLE_SHARED_SECRET"
+        return False, None, "Server configuration error: Missing APPLE_SHARED_SECRET", ""
 
     payload = {
         "receipt-data": receipt_data,
@@ -45,19 +45,19 @@ async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool
                 status = data.get("status")
 
         if status != 0:
-            return False, None, f"Apple Verification Failed. Status Code: {status}"
+            return False, None, f"Apple Verification Failed. Status Code: {status}", ""
 
         # Step 3: Parse the latest_receipt_info to find the active subscription
         latest_receipt_info = data.get("latest_receipt_info", [])
         if not latest_receipt_info:
-            return False, None, "No active subscription found in receipt."
+            return False, None, "No active subscription found in receipt.", ""
 
         # Find the most recent transaction for the requested product_id
         # Apple returns an array, usually sorted from oldest to newest
         target_transactions = [t for t in latest_receipt_info if t.get("product_id") == product_id]
         
         if not target_transactions:
-            return False, None, f"Product {product_id} not found in this receipt."
+            return False, None, f"Product {product_id} not found in this receipt.", ""
 
         # Get the transaction with the furthest expiration date
         latest_transaction = max(
@@ -69,15 +69,15 @@ async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool
         current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         if expires_date_ms <= current_time_ms:
-            return False, None, "Subscription has expired."
+            return False, None, "Subscription has expired.", ""
 
         # Calculate expiry ISO
         expiry_dt = datetime.fromtimestamp(expires_date_ms / 1000, tz=timezone.utc)
         expiry_iso = expiry_dt.isoformat()
 
         print(f"[APPLE VERIFY] Validation success for {product_id}. Expires at {expiry_iso}")
-        return True, expiry_iso, "Success"
+        return True, expiry_iso, "Success", latest_transaction.get("original_transaction_id", "")
 
     except Exception as e:
         print(f"[APPLE VERIFY] Exception during apple verification: {str(e)}")
-        return False, None, f"Internal Verification Error: {str(e)}"
+        return False, None, f"Internal Verification Error: {str(e)}", ""
