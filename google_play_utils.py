@@ -83,12 +83,15 @@ async def verify_subscription(purchase_token: str, product_id: str):
         payment_state = response.get('paymentState')
         expiry_time_ms = response.get('expiryTimeMillis')
         
-        if payment_state == 1 and expiry_time_ms:
+        if payment_state in [1, 2] and expiry_time_ms:
             # Convert ms timestamp to ISO string
             expiry_dt = datetime.fromtimestamp(int(expiry_time_ms) / 1000, tz=timezone.utc)
+            status_name = "Active" if payment_state == 1 else "Free Trial"
+            print(f"[GOOGLE] Verification success: {status_name}. Expires: {expiry_dt.isoformat()}")
             return True, expiry_dt.isoformat(), "Success"
         else:
-            return False, None, f"Status: {payment_state or 'Unknown'}"
+            reason = f"Status: {payment_state}" if payment_state is not None else "Unknown State"
+            return False, None, reason
             
     except HttpError as e:
         try:
