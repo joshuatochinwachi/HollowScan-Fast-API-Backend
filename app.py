@@ -2749,13 +2749,20 @@ async def apple_webhook(background_tasks: BackgroundTasks, request: Request):
                 b64 += "=" * (4 - len(b64) % 4)
                 transaction_info = json.loads(base64.urlsafe_b64decode(b64))
 
+        # Extract appAccountToken if available (StoreKit 2 feature)
+        app_account_token = transaction_info.get("appAccountToken", "")
         original_transaction_id = transaction_info.get("originalTransactionId", "")
         expires_ms = transaction_info.get("expiresDate", 0)
+        
+        print(f"[APPLE WEBHOOK] Info - Txn: {original_transaction_id}, UserToken: {app_account_token}, Type: {notification_type}")
+
         expiry_iso = None
         if expires_ms:
             expiry_iso = datetime.fromtimestamp(int(expires_ms) / 1000, tz=timezone.utc).isoformat()
 
         user_data = None
+        
+        # 1. Primary Lookup: By Original Transaction ID
         if original_transaction_id:
             resp = await http_client.get(
                 f"{URL}/rest/v1/users?apple_original_transaction_id=eq.{original_transaction_id}&select=*",
@@ -2763,9 +2770,24 @@ async def apple_webhook(background_tasks: BackgroundTasks, request: Request):
             )
             if resp.status_code == 200 and resp.json():
                 user_data = resp.json()[0]
+                print(f"[APPLE WEBHOOK] User found via original_transaction_id: {user_data.get('id')}")
+
+        # 2. Secondary Lookup: By appAccountToken (UUID fallback)
+        if not user_data and app_account_token:
+            print(f"[APPLE WEBHOOK] Searching via appAccountToken fallback: {app_account_token}")
+            resp = await http_client.get(
+                f"{URL}/rest/v1/users?id=eq.{app_account_token}&select=*",
+                headers=HEADERS
+            )
+            if resp.status_code == 200 and resp.json():
+                user_data = resp.json()[0]
+                print(f"[APPLE WEBHOOK] User found via appAccountToken: {user_data.get('id')}")
+                # IMPORTANT: Link this transaction ID to the user now so future webhooks find them via Primary Lookup
+                if original_transaction_id:
+                    background_tasks.add_task(update_user, user_data['id'], {"apple_original_transaction_id": original_transaction_id})
 
         if not user_data:
-            print(f"[APPLE WEBHOOK] No user found for txn {original_transaction_id}. Skipping.")
+            print(f"[APPLE WEBHOOK] CRITICAL: No user found for txn {original_transaction_id} or token {app_account_token}. skipping.")
             return {"status": "ok"}
 
         user_id = user_data["id"]

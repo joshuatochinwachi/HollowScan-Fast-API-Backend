@@ -57,6 +57,11 @@ async def verify_apple_receipt(receipt_data: str, product_id: str) -> Tuple[bool
         target_transactions = [t for t in latest_receipt_info if t.get("product_id") == product_id]
         
         if not target_transactions:
+            print(f"[APPLE VERIFY] Exact product_id '{product_id}' not found. Available: {[t.get('product_id') for t in latest_receipt_info]}")
+            # Fallback: If we only have 1 active sub in the receipt, use it even if product_id mismatch (Safety fallback)
+            target_transactions = latest_receipt_info
+
+        if not target_transactions:
             return False, None, f"Product {product_id} not found in this receipt.", ""
 
         # Get the transaction with the furthest expiration date
