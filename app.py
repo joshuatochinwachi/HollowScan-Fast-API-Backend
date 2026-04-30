@@ -916,6 +916,110 @@ async def update_user_profile(profile: UserProfileUpdate):
         print(f"[PROFILE] Error updating: {e}")
         return {"success": False, "message": str(e)}
 
+# --- POKEMON CENTER MONITOR ENDPOINTS ---
+
+@app.get("/v1/monitor/pokemon-center/status")
+async def get_pokemon_center_status(user_id: str = Query(...)):
+    """
+    Returns the live status of the Pokémon Center queue monitor.
+    STRICT GATING: If user is not premium, returns LOCKED.
+    """
+    try:
+        # 1. Fetch user to check premium status
+        user_data = await get_user_by_id(user_id)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Using the existing verification helper
+        is_premium = await verify_premium_status(user_id, user_data)
+        
+        # 2. IF NOT PREMIUM: Return the "Black Box" state (No leaks!)
+        if not is_premium:
+            return {
+                "success": True,
+                "state": "LOCKED",
+                "is_premium": False,
+                "monitor_healthy": True,
+                "message": "Upgrade to Premium to access live site monitors."
+            }
+        
+        # 3. IF PREMIUM: Fetch the real data AND check subscription status in parallel
+        responses = await asyncio.gather(
+            http_client.get(f"{URL}/rest/v1/pc_monitor_state?select=*", headers=HEADERS),
+            http_client.get(f"{URL}/rest/v1/pc_monitor_subscribers?user_id=eq.{user_id}&is_active=eq.true&select=id", headers=HEADERS)
+        )
+        
+        state_resp, sub_resp = responses
+        is_subscribed = sub_resp.status_code == 200 and len(sub_resp.json()) > 0
+
+        if state_resp.status_code == 200 and state_resp.json():
+            data = state_resp.json()[0]
+            current_state = data.get("state", "NORMAL")
+            
+            return {
+                "success": True,
+                "is_premium": True,
+                "is_subscribed": is_subscribed,
+                "state": current_state,
+                "detected_at": data.get("detected_at"),
+                "last_checked": data.get("last_checked"),
+                "confidence_score": data.get("confidence_score"),
+                "queue_details": data.get("queue_details") or {},
+                "monitor_healthy": data.get("monitor_healthy", True),
+                "message": "Monitoring active. Site normal." if current_state == "NORMAL" else "🚨 QUEUE IS LIVE!"
+            }
+            
+        return {"success": False, "state": "UNKNOWN", "message": "Monitor state not found."}
+        
+    except Exception as e:
+        print(f"[MONITOR] Error fetching status for {user_id}: {e}")
+        return {"success": False, "state": "ERROR", "message": "System temporarily unavailable."}
+
+@app.post("/v1/monitor/pokemon-center/subscribe")
+async def subscribe_to_pc_monitor(data: Dict = Body(...)):
+    """
+    Subscribe a user to PC Queue Alerts.
+    Requires premium status.
+    """
+    user_id = data.get("user_id")
+    fcm_token = data.get("fcm_token")
+    
+    if not user_id or not fcm_token:
+        raise HTTPException(status_code=400, detail="Missing user_id or fcm_token")
+        
+    user_data = await get_user_by_id(user_id)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    is_premium = await verify_premium_status(user_id, user_data)
+    
+    if not is_premium:
+        raise HTTPException(status_code=403, detail="Premium subscription required for monitor alerts.")
+    
+    try:
+        # Store the subscription in Supabase
+        payload = {
+            "user_id": user_id,
+            "fcm_token": fcm_token,
+            "is_active": True
+        }
+        # Upsert into subscribers table
+        response = await http_client.post(
+            f"{URL}/rest/v1/pc_monitor_subscribers",
+            headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json=payload
+        )
+        
+        if response.status_code in [200, 201, 204]:
+            return {"success": True, "message": "Alerts enabled for Pokémon Center!"}
+        else:
+            print(f"[MONITOR] Sub failed: {response.status_code} {response.text}")
+            return {"success": False, "message": "Failed to enable alerts."}
+            
+    except Exception as e:
+        print(f"[MONITOR] Subscription error: {e}")
+        return {"success": False, "message": str(e)}
+
 # --- TELEGRAM LINKING ENDPOINTS ---
 
 @app.get("/v1/user/telegram/link-status")
