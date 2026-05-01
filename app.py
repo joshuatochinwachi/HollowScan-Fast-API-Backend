@@ -1020,6 +1020,34 @@ async def subscribe_to_pc_monitor(data: Dict = Body(...)):
         print(f"[MONITOR] Subscription error: {e}")
         return {"success": False, "message": str(e)}
 
+@app.post("/v1/monitor/pokemon-center/unsubscribe")
+async def unsubscribe_from_pc_monitor(data: Dict = Body(...)):
+    """
+    Unsubscribe a user from PC Queue Alerts.
+    Sets is_active to False in Supabase.
+    """
+    user_id = data.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+        
+    try:
+        # Update the subscription to inactive
+        response = await http_client.patch(
+            f"{URL}/rest/v1/pc_monitor_subscribers?user_id=eq.{user_id}",
+            headers=HEADERS,
+            json={"is_active": False}
+        )
+        
+        if response.status_code in [200, 204]:
+            return {"success": True, "message": "Alerts disabled for Pokémon Center."}
+        else:
+            print(f"[MONITOR] Unsub failed: {response.status_code} {response.text}")
+            return {"success": False, "message": "Failed to disable alerts."}
+            
+    except Exception as e:
+        print(f"[MONITOR] Unsubscription error: {e}")
+        return {"success": False, "message": str(e)}
+
 # --- TELEGRAM LINKING ENDPOINTS ---
 
 @app.get("/v1/user/telegram/link-status")
