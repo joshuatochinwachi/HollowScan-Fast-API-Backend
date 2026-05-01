@@ -1006,7 +1006,7 @@ async def subscribe_to_pc_monitor(data: Dict = Body(...)):
         }
         # Upsert into subscribers table (Use SERVICE_HEADERS to bypass RLS)
         response = await http_client.post(
-            f"{URL}/rest/v1/pc_monitor_subscribers",
+            f"{URL}/rest/v1/pc_monitor_subscribers?on_conflict=user_id,fcm_token",
             headers={**SERVICE_HEADERS, "Prefer": "resolution=merge-duplicates"},
             json=payload
         )
