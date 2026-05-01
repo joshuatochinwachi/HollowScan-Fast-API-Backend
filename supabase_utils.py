@@ -23,6 +23,7 @@ def get_supabase_config():
     """Get Supabase configuration"""
     url = os.getenv("SUPABASE_URL", "").strip()
     key = os.getenv("SUPABASE_KEY", "").strip()
+    service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     
     if not url or not key:
         raise RuntimeError("❌ Missing SUPABASE_URL or SUPABASE_KEY")
@@ -31,7 +32,7 @@ def get_supabase_config():
     if url.endswith('/'):
         url = url[:-1]
     
-    return url, key
+    return url, key, service_role_key
 
 
 # -------------------

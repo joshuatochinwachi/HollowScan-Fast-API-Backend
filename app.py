@@ -92,8 +92,9 @@ app = FastAPI(title="hollowScan Mobile API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], max_age=3600)
 
-URL, KEY = get_supabase_config()
+URL, KEY, SERVICE_KEY = get_supabase_config()
 HEADERS = {'apikey': KEY, 'Authorization': f'Bearer {KEY}', 'Content-Type': 'application/json', 'Prefer': 'return=representation'}
+SERVICE_HEADERS = {'apikey': SERVICE_KEY, 'Authorization': f'Bearer {SERVICE_KEY}', 'Content-Type': 'application/json', 'Prefer': 'return=representation'} if SERVICE_KEY else HEADERS
 SUPABASE_BUCKET = "monitor-data"
 
 # Global storage for push tokens (Move to DB irl)
@@ -1003,10 +1004,10 @@ async def subscribe_to_pc_monitor(data: Dict = Body(...)):
             "fcm_token": fcm_token,
             "is_active": True
         }
-        # Upsert into subscribers table
+        # Upsert into subscribers table (Use SERVICE_HEADERS to bypass RLS)
         response = await http_client.post(
             f"{URL}/rest/v1/pc_monitor_subscribers",
-            headers={**HEADERS, "Prefer": "resolution=merge-duplicates"},
+            headers={**SERVICE_HEADERS, "Prefer": "resolution=merge-duplicates"},
             json=payload
         )
         
@@ -1031,10 +1032,10 @@ async def unsubscribe_from_pc_monitor(data: Dict = Body(...)):
         raise HTTPException(status_code=400, detail="Missing user_id")
         
     try:
-        # Update the subscription to inactive
+        # Update the subscription to inactive (Use SERVICE_HEADERS to bypass RLS)
         response = await http_client.patch(
             f"{URL}/rest/v1/pc_monitor_subscribers?user_id=eq.{user_id}",
-            headers=HEADERS,
+            headers=SERVICE_HEADERS,
             json={"is_active": False}
         )
         
