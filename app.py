@@ -944,10 +944,10 @@ async def get_pokemon_center_status(user_id: str = Query(...)):
                 "message": "Upgrade to Premium to access live site monitors."
             }
         
-        # 3. IF PREMIUM: Fetch the real data AND check subscription status in parallel
+        # 3. IF PREMIUM: Fetch the real data AND check subscription status in parallel (Use SERVICE_HEADERS to bypass RLS)
         responses = await asyncio.gather(
-            http_client.get(f"{URL}/rest/v1/pc_monitor_state?select=*", headers=HEADERS),
-            http_client.get(f"{URL}/rest/v1/pc_monitor_subscribers?user_id=eq.{user_id}&is_active=eq.true&select=id", headers=HEADERS)
+            http_client.get(f"{URL}/rest/v1/pc_monitor_state?select=*", headers=SERVICE_HEADERS),
+            http_client.get(f"{URL}/rest/v1/pc_monitor_subscribers?user_id=eq.{user_id}&is_active=eq.true&select=id", headers=SERVICE_HEADERS)
         )
         
         state_resp, sub_resp = responses
