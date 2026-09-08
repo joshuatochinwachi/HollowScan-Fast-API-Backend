@@ -884,7 +884,40 @@ async def get_user_status(background_tasks: BackgroundTasks, user_id: str = Quer
             event.set()
             del PENDING_READS[cache_key]
 
+# --- INTERNAL CACHE INVALIDATION ENDPOINT ---
+
+@app.post("/v1/internal/cache-invalidate")
+async def internal_cache_invalidate(data: Dict = Body(...), x_internal_key: Optional[str] = Header(None)):
+    """
+    Internal endpoint: bust the user_cache for a specific user_id.
+    Called by the Telegram bot immediately after syncing premium status
+    so the mobile app sees the change on its next /v1/user/status poll.
+
+    Auth: X-Internal-Key header must match the SUPABASE_KEY (shared secret
+    already present in both the backend and bot environments).
+    """
+    # Validate caller identity using the shared Supabase service key
+    expected_key = os.getenv("SUPABASE_KEY", "")
+    if not expected_key or x_internal_key != expected_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    user_id = data.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    invalidated = []
+    for pattern in [f"user_status:{user_id}", f"user_profile:{user_id}"]:
+        try:
+            user_cache.invalidate(pattern)
+            invalidated.append(pattern)
+        except Exception as e:
+            print(f"[CACHE-INVALIDATE] Warning: could not invalidate '{pattern}': {e}")
+
+    print(f"[CACHE-INVALIDATE] Busted cache for user {user_id[:8]}... keys={invalidated}")
+    return {"success": True, "invalidated": invalidated}
+
 # --- USER PROFILE ENDPOINTS ---
+
 
 class UserProfileUpdate(BaseModel):
     user_id: str
