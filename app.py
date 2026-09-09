@@ -2684,6 +2684,19 @@ async def get_announcement_data():
     msg = os.getenv("APP_ANNOUNCEMENT", "")
     return {"message": msg}
 
+@app.get("/v1/promo/active")
+async def get_active_promo():
+    """
+    Returns the currently active promo campaign for the mobile app.
+    Controlled by the PROMO_CODE environment variable in Railway.
+    If PROMO_CODE is empty or unset, the promo feature is completely disabled app-wide.
+    """
+    code = os.getenv("PROMO_CODE", "").strip().upper()
+    return {
+        "active": bool(code),
+        "code": code
+    }
+
 # --- GOOGLE PLAY SUBSCRIPTION VERIFICATION & SYNC ---
 
 async def update_bot_user_premium(telegram_id: str, expiry_iso: str, source: str = "google_play"):
