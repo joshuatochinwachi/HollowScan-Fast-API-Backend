@@ -224,12 +224,16 @@ def scrape_og_image_regex(html_text: str) -> Optional[str]:
 async def async_enrich_product_image(msg_id: str, candidate_urls: list):
     """Background worker: tries candidate URLs in order, scrapes og:image, patches Supabase."""
     if not candidate_urls or not msg_id:
+        print(f"[IMAGE ENRICH] SKIP {msg_id}: no candidate URLs provided")
         return
     skip_patterns = ['keepa.com', 'ebay.com/sch', 'login', 'cart', 'checkout', 'bugs.zephr', '/member/']
+    attempted = []
     for buy_url in candidate_urls:
         if not buy_url or not isinstance(buy_url, str) or not buy_url.startswith("http"):
+            print(f"[IMAGE ENRICH] SKIP {msg_id}: invalid/empty URL -> {repr(buy_url)[:80]}")
             continue
         if any(x in buy_url.lower() for x in skip_patterns):
+            print(f"[IMAGE ENRICH] SKIP {msg_id}: URL matched skip pattern -> {buy_url[:80]}")
             continue
         try:
             clean_url = buy_url
@@ -242,37 +246,59 @@ async def async_enrich_product_image(msg_id: str, candidate_urls: list):
                     if not target.startswith('http'): target = 'https://' + target.lstrip('/')
                     clean_url = target
             if any(x in clean_url.lower() for x in skip_patterns):
+                print(f"[IMAGE ENRICH] SKIP {msg_id}: unwrapped URL matched skip pattern -> {clean_url[:80]}")
                 continue
+            attempted.append(clean_url[:80])
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             }
             resp = await http_client.get(clean_url, headers=headers, timeout=8.0, follow_redirects=True)
-            if resp.status_code == 200:
-                found_img = scrape_og_image_regex(resp.text)
-                if found_img and is_valid_product_image(found_img):
-                    found_img = optimize_image_url(found_img)
-                    RESOLVED_IMAGE_CACHE[buy_url] = found_img
-                    RESOLVED_IMAGE_CACHE[clean_url] = found_img
-                    get_res = await http_client.get(f"{URL}/rest/v1/discord_messages?id=eq.{msg_id}&select=raw_data", headers=HEADERS)
-                    if get_res.status_code == 200 and get_res.json():
-                        raw_d = get_res.json()[0].get("raw_data") or {}
-                        if "embed" not in raw_d or not isinstance(raw_d["embed"], dict):
-                            raw_d["embed"] = {}
-                        raw_d["embed"]["images"] = [found_img]
-                        raw_d["embed"]["image"] = {"url": found_img}
-                        raw_d["embed"]["thumbnail"] = {"url": found_img}
-                        raw_d["product_image"] = found_img
-                        await http_client.patch(
-                            f"{URL}/rest/v1/discord_messages?id=eq.{msg_id}",
-                            headers=HEADERS,
-                            json={"raw_data": raw_d}
-                        )
-                        print(f"[IMAGE ENRICH] OK Patched {msg_id} with scraped image from {clean_url[:50]}: {found_img[:60]}")
-                    return  # Success — stop trying further URLs
+            if resp.status_code != 200:
+                print(f"[IMAGE ENRICH] HTTP {resp.status_code} for {msg_id} -> {clean_url[:80]}")
+                continue
+            found_img = scrape_og_image_regex(resp.text)
+            if not found_img:
+                print(f"[IMAGE ENRICH] NO OG TAG for {msg_id} -> {clean_url[:80]} (page len={len(resp.text)})")
+                continue
+            if not is_valid_product_image(found_img):
+                print(f"[IMAGE ENRICH] INVALID IMAGE for {msg_id} -> scraped={found_img[:80]}")
+                continue
+            found_img = optimize_image_url(found_img)
+            RESOLVED_IMAGE_CACHE[buy_url] = found_img
+            RESOLVED_IMAGE_CACHE[clean_url] = found_img
+            get_res = await http_client.get(f"{URL}/rest/v1/discord_messages?id=eq.{msg_id}&select=raw_data", headers=HEADERS)
+            if get_res.status_code != 200 or not get_res.json():
+                print(f"[IMAGE ENRICH] DB FETCH FAIL for {msg_id}: HTTP {get_res.status_code}")
+                return
+            raw_d = get_res.json()[0].get("raw_data") or {}
+            if "embed" not in raw_d or not isinstance(raw_d["embed"], dict):
+                raw_d["embed"] = {}
+            raw_d["embed"]["images"] = [found_img]
+            raw_d["embed"]["image"] = {"url": found_img}
+            raw_d["embed"]["thumbnail"] = {"url": found_img}
+            raw_d["product_image"] = found_img
+            patch_res = await http_client.patch(
+                f"{URL}/rest/v1/discord_messages?id=eq.{msg_id}",
+                headers=HEADERS,
+                json={"raw_data": raw_d}
+            )
+            if patch_res.status_code not in [200, 201, 204]:
+                print(f"[IMAGE ENRICH] DB PATCH FAIL for {msg_id}: HTTP {patch_res.status_code} {patch_res.text[:100]}")
+                return
+            print(f"[IMAGE ENRICH] OK Patched {msg_id} with scraped image from {clean_url[:50]}: {found_img[:60]}")
+            # Bust the feed cache so this product is re-fetched from DB with the new image
+            try:
+                product_list_cache.invalidate(None)
+                print(f"[IMAGE ENRICH] Feed cache busted after enriching {msg_id}")
+            except Exception as cache_err:
+                print(f"[IMAGE ENRICH] Cache bust failed: {cache_err}")
+            return  # Success — stop trying further URLs
         except Exception as e:
-            print(f"[IMAGE ENRICH] Failed for {msg_id} / {buy_url[:50]}: {e}")
+            print(f"[IMAGE ENRICH] EXCEPTION for {msg_id} / {buy_url[:50]}: {type(e).__name__}: {e}")
             continue
+    # All URLs exhausted without finding an image
+    print(f"[IMAGE ENRICH] EXHAUSTED {msg_id}: tried {len(attempted)} URL(s) with no result -> {attempted}")
 
 
 def db_retry(retries: int = 5, backoff: float = 1.0):
@@ -1944,7 +1970,13 @@ def extract_product(msg, channel_map):
         if cached_img and is_valid_product_image(cached_img):
             image = cached_img
 
-    final_image = image if is_valid_product_image(image) else "https://via.placeholder.com/400"
+    if not is_valid_product_image(image):
+        msg_id_log = str(msg.get("id", "?"))
+        has_embed_imgs = bool(embed.get("images") or embed.get("image") or embed.get("thumbnail"))
+        print(f"[IMAGE MISSING] msg={msg_id_log} title={title[:40]!r} embed_has_imgs={has_embed_imgs} raw_image_val={repr(image)[:80]}")
+        final_image = "https://via.placeholder.com/400"
+    else:
+        final_image = image
 
     product_data = {
         "title": title[:100], "description": description[:500],
