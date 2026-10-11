@@ -133,6 +133,7 @@ DEFAULT_CHANNELS = [
 def optimize_image_url(url: str) -> str:
     if not url: return url
     try:
+        # Unwrap Discord proxy URLs (images-ext-*) that tunnel external images
         if "images-ext-" in url and "discordapp.net" in url:
             if "/https/" in url: url = "https://" + url.split("/https/", 1)[1]
             elif "/http/" in url: url = "http://" + url.split("/http/", 1)[1]
@@ -142,7 +143,10 @@ def optimize_image_url(url: str) -> str:
         if "ebayimg.com" in url:
             if re.search(r's-l\d+\.', url): url = re.sub(r's-l\d+\.', 's-l1600.', url)
             if "?" in url: url = url.split("?")[0]
-        if "discordapp.net" in url and "?" in url: url = url.split("?")[0]
+        # ⚠️ DO NOT strip query params from cdn.discordapp.com or media.discordapp.net —
+        # Discord now uses ephemeral signed URLs (?ex=...&is=...&hm=...) for attachments.
+        # Stripping them causes 403 Forbidden, which triggers "Image Pending" in the mobile app.
+        # Only strip from the old images-ext proxy (handled above by unwrapping).
     except: pass
     return url
 
@@ -157,8 +161,39 @@ def is_valid_product_image(url: Optional[str]) -> bool:
     if u.startswith("data:image"):
         return False
     u_low = u.lower()
+    # Block generic placeholder/no-image keyword patterns
     for bad in ["placeholder", "noimage", "no-image", "notfound", "comingsoon", "coming-soon", "unavailable", "no-photo", "image-not-available"]:
         if bad in u_low:
+            return False
+    # Block known generic/junk images that scraping sometimes picks up:
+    # - Discord's generic OG/share image (not a product photo)
+    # - Small avatar/icon assets from Discord, Shopify, or generic CDNs
+    junk_paths = [
+        "og_img_discord_home",     # Discord homepage share image
+        "assets/og_img",           # Discord/generic OG assets
+        "avatar-black.png",        # Shopify avatar placeholder
+        "avatar-white.png",
+        "default-avatar",
+        "/assets/avatar",
+        "discord-mark-black",      # Discord brand logo
+        "discord-mark-white",
+        "discord-mark-blue",
+        "discord_logo",
+        "/s-l32.",                 # eBay tiny thumbnails
+        "/s-l48.",
+        "/s-l64.",
+        "/s-l96.",
+        "spinner",
+        "loading-placeholder",
+        "/blank.",
+        "1x1.png",
+        "1x1.gif",
+        "pixel.gif",
+        "pixel.png",
+        "spacer.gif",
+    ]
+    for junk in junk_paths:
+        if junk in u_low:
             return False
     return True
 
