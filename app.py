@@ -2160,40 +2160,29 @@ async def get_feed(
                     seen_signatures.add(p["content_signature"])
         
         chunks_scanned = 0
-        base_max = 100 if premium_user else 30
-        search_multiplier = 20 if search else 1
-        max_chunks = base_max * search_multiplier
-        batch_limit = 1000 if search else 50
-        
-        # Target size for the cache fill
-        if cache_refill_mode:
-            cache_fill_target = len(all_products) + 50 # Add a small batch on refill
+        if search_is_active:
+            batch_limit = 500
+            cache_fill_target = 60
+            max_chunks = 10  # Scans up to 5,000 recent messages
         else:
-            cache_fill_target = 300 if search_is_active else 100
+            base_max = 100 if premium_user else 30
+            max_chunks = base_max
+            batch_limit = 50
+            if cache_refill_mode:
+                cache_fill_target = len(all_products) + 50 # Add a small batch on refill
+            else:
+                cache_fill_target = 100
         
         db_end_reached = False
         while len(all_products) < cache_fill_target and chunks_scanned < max_chunks:
             query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}"
             if id_filter and not search_is_active: query += id_filter
-                 
-            if search_is_active:
-                keywords = [k.strip() for k in search.split() if len(k.strip()) >= 1]
-                if keywords:
-                    or_parts = []
-                    for k in keywords:
-                        or_parts.append(f"content.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embeds->0->>title.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embeds->0->>description.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embed->>title.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embed->>description.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embeds->0->fields->0->>value.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embeds->0->fields->1->>value.ilike.*{k}*")
-                        or_parts.append(f"raw_data->embeds->0->author->>name.ilike.*{k}*")
-                    query += f"&or=({','.join(or_parts)})"
                     
             try:
                 response = await http_client.get(f"{URL}/rest/v1/discord_messages?{query}", headers=HEADERS)
-                if response.status_code != 200: break
+                if response.status_code != 200:
+                    print(f"[FEED] Supabase query failed: HTTP {response.status_code} - {response.text[:200]}")
+                    break
                 messages = response.json()
                 if not messages: 
                     db_end_reached = True
@@ -2237,8 +2226,10 @@ async def get_feed(
                     
                     if search_is_active:
                         search_keywords = [k.lower().strip() for k in search.split() if k.strip()]
-                        search_blob = f"{p_data.get('title','')}\n{p_data.get('description','')}\n{prod.get('category_name','')}".lower()
-                        if not any(kw in search_blob for kw in search_keywords): continue
+                        details_str = " ".join(f"{d.get('label', '')} {d.get('value', '')}" for d in p_data.get("details", []))
+                        search_blob = f"{p_data.get('title', '')} {p_data.get('description', '')} {prod.get('category_name', '')} {prod.get('region', '')} {msg.get('content', '')} {details_str}".lower()
+                        if not all(kw in search_blob for kw in search_keywords):
+                            continue
     
                     if not search_is_active:
                         if region and region.strip().upper() != "ALL" and prod["region"].strip() != region.strip(): continue
