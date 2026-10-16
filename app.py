@@ -82,6 +82,13 @@ async def lifespan(app: FastAPI):
     
     # Start background worker
     asyncio.create_task(background_notification_worker())
+
+    # Warm up Logo Sanitizer (channels & reference logo pHash)
+    try:
+        asyncio.create_task(get_logo_filter_channel_ids())
+        asyncio.create_task(asyncio.to_thread(_get_backend_logo_phash))
+    except Exception as e:
+        print(f"[STARTUP] Logo Sanitizer warmup error: {e}")
     
     yield
 
@@ -1982,6 +1989,12 @@ def extract_product(msg, channel_map):
     else:
         final_image = image
 
+    # Logo Sanitizer Gatekeeper: check if channel is monitored for RP logo
+    ch_id = str(msg.get("channel_id", "")).strip()
+    if _is_logo_monitored_channel(ch_id):
+        if final_image and is_logo_filtered_image_url(final_image):
+            final_image = FALLBACK_IMAGE_URL
+
     product_data = {
         "title": title[:100], "description": description[:500],
         "image": final_image,
@@ -2071,6 +2084,141 @@ async def get_channels_data():
                         if channels: break
                 except: continue
     return channels or DEFAULT_CHANNELS
+
+
+# --- LOGO FILTER CHANNEL CACHE & IMAGE CHECKER ---
+# Railway-ready: Reference logo is fetched from GitHub raw URL, with in-memory pHash caching
+_BACKEND_RP_LOGO_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo.png"
+FALLBACK_IMAGE_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/no_image.png"
+
+_LOGO_FILTER_CHANNELS_CACHE: set = set()
+_LOGO_FILTER_LAST_FETCH: float = 0
+_BACKEND_RP_LOGO_PHASH: Optional[int] = None
+_BACKEND_PHASH_CACHE: Dict[str, Optional[int]] = {}
+
+def _compute_phash_backend(img_bytes: bytes) -> Optional[int]:
+    """Compute 1024-bit perceptual hash with alpha compositing."""
+    try:
+        from io import BytesIO
+        from PIL import Image
+        raw_img = Image.open(BytesIO(img_bytes))
+        if raw_img.mode in ("RGBA", "LA") or (raw_img.mode == "P" and "transparency" in raw_img.info):
+            raw_img = raw_img.convert("RGBA")
+            bg = Image.new("RGBA", raw_img.size, (255, 255, 255, 255))
+            bg.alpha_composite(raw_img)
+            img = bg.convert("L")
+        else:
+            img = raw_img.convert("L")
+        img = img.resize((32, 32), Image.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = [1 if p >= avg else 0 for p in pixels]
+        return int("".join(str(b) for b in bits), 2)
+    except Exception:
+        return None
+
+def _get_backend_logo_phash() -> Optional[int]:
+    """Fetch RP logo from GitHub raw URL (Railway deployment friendly) and cache pHash."""
+    global _BACKEND_RP_LOGO_PHASH
+    if _BACKEND_RP_LOGO_PHASH is not None:
+        return _BACKEND_RP_LOGO_PHASH
+    try:
+        import requests
+        resp = requests.get(_BACKEND_RP_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        if resp.status_code == 200:
+            _BACKEND_RP_LOGO_PHASH = _compute_phash_backend(resp.content)
+            if _BACKEND_RP_LOGO_PHASH:
+                print(f"[LOGO SANITIZER] Loaded reference pHash from GitHub: {hex(_BACKEND_RP_LOGO_PHASH)}")
+                return _BACKEND_RP_LOGO_PHASH
+    except Exception as e:
+        print(f"[LOGO SANITIZER] Could not download RP logo from GitHub ({e})")
+
+    # Local fallback in case run locally
+    for p in ["public/RP_logo.png", "../public/RP_logo.png", "RP_logo.png"]:
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    _BACKEND_RP_LOGO_PHASH = _compute_phash_backend(f.read())
+                    if _BACKEND_RP_LOGO_PHASH:
+                        return _BACKEND_RP_LOGO_PHASH
+            except Exception:
+                pass
+    return None
+
+async def get_logo_filter_channel_ids() -> set:
+    """Fetch logo-filtered channel IDs from storage or local fallback (60s TTL)"""
+    global _LOGO_FILTER_CHANNELS_CACHE, _LOGO_FILTER_LAST_FETCH
+    now = time.time()
+    if (now - _LOGO_FILTER_LAST_FETCH) < 60 and _LOGO_FILTER_CHANNELS_CACHE:
+        return _LOGO_FILTER_CHANNELS_CACHE
+
+    channel_ids = set()
+    try:
+        storage_url = f"{URL}/storage/v1/object/authenticated/monitor-data/discord_josh/logo_filter_channels.json"
+        res = await http_client.get(storage_url, headers=HEADERS)
+        if res.status_code == 200:
+            channel_ids = set(str(cid).strip() for cid in (res.json() or []))
+    except Exception:
+        pass
+
+    if not channel_ids:
+        for filename in ["data/logo_filter_channels.json", "../data/logo_filter_channels.json", "logo_filter_channels.json"]:
+            if os.path.exists(filename):
+                try:
+                    with open(filename, "r") as f:
+                        channel_ids = set(str(cid).strip() for cid in json.load(f))
+                        if channel_ids:
+                            break
+                except Exception:
+                    continue
+
+    _LOGO_FILTER_CHANNELS_CACHE = channel_ids
+    _LOGO_FILTER_LAST_FETCH = now
+    return _LOGO_FILTER_CHANNELS_CACHE
+
+def _is_logo_monitored_channel(ch_id: Any) -> bool:
+    """Synchronous check against in-memory cached logo-monitored channel IDs."""
+    if not ch_id or not _LOGO_FILTER_CHANNELS_CACHE:
+        return False
+    return str(ch_id).strip() in _LOGO_FILTER_CHANNELS_CACHE
+
+def is_logo_filtered_image_url(image_url: Optional[str]) -> bool:
+    """Check if an image URL matches the RP logo (fast-path string check + pHash)."""
+    if not image_url or not str(image_url).startswith("http"):
+        return False
+
+    u = str(image_url).strip()
+    u_low = u.lower()
+
+    # Fast Path: Instant string check (0ms, zero network)
+    if "rp_logo" in u_low or "retailpinger" in u_low:
+        return True
+
+    ref_phash = _get_backend_logo_phash()
+    if ref_phash is None:
+        return False
+
+    if u in _BACKEND_PHASH_CACHE:
+        cand_hash = _BACKEND_PHASH_CACHE[u]
+    else:
+        try:
+            import requests
+            r = requests.get(u, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            if r.status_code != 200:
+                return False
+            cand_hash = _compute_phash_backend(r.content)
+            _BACKEND_PHASH_CACHE[u] = cand_hash
+            if len(_BACKEND_PHASH_CACHE) > 2000:
+                _BACKEND_PHASH_CACHE.clear()
+        except Exception:
+            return False
+
+    if cand_hash is None:
+        return False
+    diff = bin(ref_phash ^ cand_hash).count("1")
+    return diff <= 10
+
+
 
 @app.get("/v1/feed")
 async def get_feed(
@@ -2210,6 +2358,7 @@ async def get_feed(
                 cache_fill_target = 100
         
         db_end_reached = False
+        logo_filter_cids = await get_logo_filter_channel_ids()
         while len(all_products) < cache_fill_target and chunks_scanned < max_chunks:
             query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}"
             if id_filter and not search_is_active: query += id_filter
@@ -2232,6 +2381,14 @@ async def get_feed(
                     
                     # Filtering logic
                     p_data = prod.get("product_data", {})
+
+                    # Logo Sanitizer Gatekeeper: replace platform logo with clean fallback so products still show on the app!
+                    if logo_filter_cids and str(msg.get("channel_id", "")) in logo_filter_cids:
+                        candidate_img = p_data.get("image")
+                        if candidate_img and is_logo_filtered_image_url(candidate_img):
+                            p_data["image"] = FALLBACK_IMAGE_URL
+                            p_data["thumbnail"] = FALLBACK_IMAGE_URL
+
                     has_image = is_valid_product_image(p_data.get("image")) and "placeholder" not in (p_data.get("image") or "")
                     has_links = bool(p_data.get("buy_url") or (p_data.get("links") and any(p_data["links"].values())))
                     try:
@@ -2391,6 +2548,7 @@ async def get_product_detail(product_id: str = Query(...)):
             msg = response.json()[0]
             
             # 2. Extract using existing logic
+            await get_logo_filter_channel_ids()
             channels = await get_channels_data()
             channel_map = {}
             for c in channels:
