@@ -83,10 +83,10 @@ async def lifespan(app: FastAPI):
     # Start background worker
     asyncio.create_task(background_notification_worker())
 
-    # Warm up Logo Sanitizer (channels & reference logo pHash)
+    # Warm up Logo Sanitizer (channels & reference logo pHashes)
     try:
         asyncio.create_task(get_logo_filter_channel_ids())
-        asyncio.create_task(asyncio.to_thread(_get_backend_logo_phash))
+        asyncio.create_task(asyncio.to_thread(_get_backend_logo_phashes))
     except Exception as e:
         print(f"[STARTUP] Logo Sanitizer warmup error: {e}")
     
@@ -172,6 +172,9 @@ def is_valid_product_image(url: Optional[str]) -> bool:
     if u.startswith("data:image"):
         return False
     u_low = u.lower()
+    # HollowScan's official fallback image is explicitly valid
+    if "no_image.png" in u_low:
+        return True
     # Block generic placeholder/no-image keyword patterns
     for bad in ["placeholder", "noimage", "no-image", "notfound", "comingsoon", "coming-soon", "unavailable", "no-photo", "image-not-available"]:
         if bad in u_low:
@@ -2087,13 +2090,16 @@ async def get_channels_data():
 
 
 # --- LOGO FILTER CHANNEL CACHE & IMAGE CHECKER ---
-# Railway-ready: Reference logo is fetched from GitHub raw URL, with in-memory pHash caching
-_BACKEND_RP_LOGO_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo.png"
+# Railway-ready: Reference logos are fetched from GitHub raw URLs, with in-memory pHash caching
+_BACKEND_RP_LOGO_URLS = [
+    "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo.png",
+    "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo2.png",
+]
 FALLBACK_IMAGE_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/no_image.png"
 
 _LOGO_FILTER_CHANNELS_CACHE: set = set()
 _LOGO_FILTER_LAST_FETCH: float = 0
-_BACKEND_RP_LOGO_PHASH: Optional[int] = None
+_BACKEND_RP_LOGO_PHASHES: List[int] = []
 _BACKEND_PHASH_CACHE: Dict[str, Optional[int]] = {}
 
 def _compute_phash_backend(img_bytes: bytes) -> Optional[int]:
@@ -2117,33 +2123,50 @@ def _compute_phash_backend(img_bytes: bytes) -> Optional[int]:
     except Exception:
         return None
 
-def _get_backend_logo_phash() -> Optional[int]:
-    """Fetch RP logo from GitHub raw URL (Railway deployment friendly) and cache pHash."""
-    global _BACKEND_RP_LOGO_PHASH
-    if _BACKEND_RP_LOGO_PHASH is not None:
-        return _BACKEND_RP_LOGO_PHASH
-    try:
-        import requests
-        resp = requests.get(_BACKEND_RP_LOGO_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if resp.status_code == 200:
-            _BACKEND_RP_LOGO_PHASH = _compute_phash_backend(resp.content)
-            if _BACKEND_RP_LOGO_PHASH:
-                print(f"[LOGO SANITIZER] Loaded reference pHash from GitHub: {hex(_BACKEND_RP_LOGO_PHASH)}")
-                return _BACKEND_RP_LOGO_PHASH
-    except Exception as e:
-        print(f"[LOGO SANITIZER] Could not download RP logo from GitHub ({e})")
+def _get_backend_logo_phashes() -> List[int]:
+    """Fetch RP logo variations from local disk or GitHub raw URLs and cache pHashes."""
+    global _BACKEND_RP_LOGO_PHASHES
+    if _BACKEND_RP_LOGO_PHASHES:
+        return _BACKEND_RP_LOGO_PHASHES
 
-    # Local fallback in case run locally
-    for p in ["public/RP_logo.png", "../public/RP_logo.png", "RP_logo.png"]:
-        if os.path.exists(p):
+    hashes = []
+    for logo_name in ["RP_logo.png", "RP_logo2.png"]:
+        loaded = False
+        # 1. Try local disk
+        for p in [f"public/{logo_name}", f"../public/{logo_name}", logo_name]:
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        h = _compute_phash_backend(f.read())
+                        if h:
+                            hashes.append(h)
+                            loaded = True
+                            print(f"[LOGO SANITIZER] Loaded reference pHash from local disk ({p}): {hex(h)}")
+                            break
+                except Exception:
+                    pass
+
+        # 2. Remote fallback (Railway deployment)
+        if not loaded:
+            remote_url = f"https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/{logo_name}"
             try:
-                with open(p, "rb") as f:
-                    _BACKEND_RP_LOGO_PHASH = _compute_phash_backend(f.read())
-                    if _BACKEND_RP_LOGO_PHASH:
-                        return _BACKEND_RP_LOGO_PHASH
-            except Exception:
-                pass
-    return None
+                import requests
+                resp = requests.get(remote_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                if resp.status_code == 200:
+                    h = _compute_phash_backend(resp.content)
+                    if h:
+                        hashes.append(h)
+                        print(f"[LOGO SANITIZER] Loaded reference pHash from GitHub ({logo_name}): {hex(h)}")
+            except Exception as e:
+                print(f"[LOGO SANITIZER] Could not download {logo_name} from GitHub ({e})")
+
+    _BACKEND_RP_LOGO_PHASHES = hashes
+    return _BACKEND_RP_LOGO_PHASHES
+
+def _get_backend_logo_phash() -> Optional[int]:
+    """Compatibility alias returning the primary reference hash."""
+    hashes = _get_backend_logo_phashes()
+    return hashes[0] if hashes else None
 
 async def get_logo_filter_channel_ids() -> set:
     """Fetch logo-filtered channel IDs from storage or local fallback (60s TTL)"""
@@ -2183,7 +2206,7 @@ def _is_logo_monitored_channel(ch_id: Any) -> bool:
     return str(ch_id).strip() in _LOGO_FILTER_CHANNELS_CACHE
 
 def is_logo_filtered_image_url(image_url: Optional[str]) -> bool:
-    """Check if an image URL matches the RP logo (fast-path string check + pHash)."""
+    """Check if an image URL matches any variation of the RP logo (fast-path string check + pHash)."""
     if not image_url or not str(image_url).startswith("http"):
         return False
 
@@ -2194,8 +2217,8 @@ def is_logo_filtered_image_url(image_url: Optional[str]) -> bool:
     if "rp_logo" in u_low or "retailpinger" in u_low:
         return True
 
-    ref_phash = _get_backend_logo_phash()
-    if ref_phash is None:
+    ref_phashes = _get_backend_logo_phashes()
+    if not ref_phashes:
         return False
 
     if u in _BACKEND_PHASH_CACHE:
@@ -2215,8 +2238,9 @@ def is_logo_filtered_image_url(image_url: Optional[str]) -> bool:
 
     if cand_hash is None:
         return False
-    diff = bin(ref_phash ^ cand_hash).count("1")
-    return diff <= 10
+
+    diffs = [bin(ref ^ cand_hash).count("1") for ref in ref_phashes]
+    return any(d <= 10 for d in diffs)
 
 
 
