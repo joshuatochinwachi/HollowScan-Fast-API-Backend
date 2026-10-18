@@ -118,6 +118,9 @@ def _log_push(msg):
 # Cache Stampede Protection: Ensures only 1 request hits DB for a specific filter set
 PENDING_READS: Dict[str, asyncio.Event] = {}
 
+# Active background search tasks for progressive deep search streaming
+ACTIVE_BACKGROUND_SEARCHES: Dict[str, asyncio.Task] = {}
+
 
 DEFAULT_CHANNELS = [
     {"id": "1367813504786108526", "name": "Collectors Amazon", "category": "UK Stores", "enabled": True},
@@ -2229,6 +2232,129 @@ def is_logo_filtered_image_url(image_url: Optional[str]) -> bool:
     return any(d <= 10 for d in diffs)
 
 
+async def async_deep_search_worker(
+    search_query: str,
+    base_cache_key: str,
+    start_sql_offset: int,
+    channel_map: Dict,
+    logo_filter_cids: set
+):
+    """
+    Background worker that continuously scans deeper into Supabase for search matches
+    across ALL countries and channels, progressively feeding product_list_cache so
+    the user experiences zero lag or wait times when scrolling through thousands of results.
+    """
+    search_keywords = [k.lower().strip() for k in search_query.split() if k.strip()]
+    if not search_keywords:
+        ACTIVE_BACKGROUND_SEARCHES.pop(base_cache_key, None)
+        return
+
+    current_sql_offset = start_sql_offset
+    batch_limit = 200
+    max_total_messages_to_scan = 15000  # Scans up to 15,000 messages deeply in background
+    scanned_so_far = 0
+    max_scan_duration = 45.0  # Keep worker bounded to 45 seconds max
+    start_time = time.time()
+    
+    print(f"[SEARCH BG] 🚀 Started deep background search for '{search_query}' starting at SQL offset {start_sql_offset}")
+    
+    try:
+        while scanned_so_far < max_total_messages_to_scan and (time.time() - start_time) < max_scan_duration:
+            # Check current cached products to append to
+            cached_data = product_list_cache.get(base_cache_key)
+            if cached_data is None:
+                # Cache was invalidated or expired
+                break
+            
+            accumulated_products, _, db_already_ended = cached_data
+            if db_already_ended or len(accumulated_products) >= 3000:
+                break
+            
+            seen_sigs = {p.get("content_signature") for p in accumulated_products if p.get("content_signature")}
+            
+            query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}"
+            try:
+                response = await http_client.get(f"{URL}/rest/v1/discord_messages?{query}", headers=HEADERS)
+                if response.status_code != 200:
+                    break
+                messages = response.json()
+                if not messages:
+                    # End of table reached
+                    product_list_cache.set(base_cache_key, accumulated_products, current_sql_offset, True)
+                    print(f"[SEARCH BG] 🏁 Reached end of DB for '{search_query}'. Total matches: {len(accumulated_products)}")
+                    return
+                
+                new_matches = 0
+                for msg in messages:
+                    sig = _get_content_signature(msg)
+                    if sig in seen_sigs:
+                        continue
+                    prod = extract_product(msg, channel_map)
+                    if not prod:
+                        continue
+                    
+                    p_data = prod.get("product_data", {})
+                    # Logo Sanitizer
+                    if logo_filter_cids and str(msg.get("channel_id", "")) in logo_filter_cids:
+                        candidate_img = p_data.get("image")
+                        if candidate_img and is_logo_filtered_image_url(candidate_img):
+                            p_data["image"] = FALLBACK_IMAGE_URL
+                            p_data["thumbnail"] = FALLBACK_IMAGE_URL
+                            
+                    has_image = is_valid_product_image(p_data.get("image")) and "placeholder" not in (p_data.get("image") or "")
+                    has_links = bool(p_data.get("buy_url") or (p_data.get("links") and any(p_data["links"].values())))
+                    try:
+                        p_num = float(str(p_data.get("price") or 0).replace(',', ''))
+                        r_num = float(str(p_data.get("resell") or 0).replace(',', ''))
+                        w_num = float(str(p_data.get("was_price") or 0).replace(',', ''))
+                        has_any_price = p_num > 0 or r_num > 0 or w_num > 0
+                    except:
+                        has_any_price = False
+                    
+                    if not (has_image or has_any_price or has_links):
+                        continue
+                    
+                    # Search match: checks title, description, category, region, content, details across ALL countries
+                    details_str = " ".join(f"{d.get('label', '')} {d.get('value', '')}" for d in p_data.get("details", []))
+                    search_blob = f"{p_data.get('title', '')} {p_data.get('description', '')} {prod.get('category_name', '')} {prod.get('region', '')} {msg.get('content', '')} {details_str}".lower()
+                    if not all(kw in search_blob for kw in search_keywords):
+                        continue
+                    
+                    prod["content_signature"] = sig
+                    accumulated_products.append(prod)
+                    seen_sigs.add(sig)
+                    new_matches += 1
+                
+                current_sql_offset += len(messages)
+                scanned_so_far += len(messages)
+                
+                # Progressively update cache after each batch if new matches found
+                if new_matches > 0:
+                    product_list_cache.set(base_cache_key, accumulated_products, current_sql_offset, False)
+                
+                if len(messages) < batch_limit:
+                    # End of table
+                    product_list_cache.set(base_cache_key, accumulated_products, current_sql_offset, True)
+                    print(f"[SEARCH BG] 🏁 Reached end of DB for '{search_query}'. Total matches: {len(accumulated_products)}")
+                    return
+                
+                # Small pause to yield event loop and prevent CPU hogging
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"[SEARCH BG] Error in background scan: {e}")
+                break
+        
+        # When scan finishes (time or chunk limit), mark partial update
+        cached_final = product_list_cache.get(base_cache_key)
+        if cached_final:
+            product_list_cache.set(base_cache_key, cached_final[0], current_sql_offset, False)
+        print(f"[SEARCH BG] ✅ Completed background scan cycle for '{search_query}' (Scanned {scanned_so_far} messages).")
+    finally:
+        ACTIVE_BACKGROUND_SEARCHES.pop(base_cache_key, None)
+
+
 
 @app.get("/v1/feed")
 async def get_feed(
@@ -2244,7 +2370,13 @@ async def get_feed(
 ):
     # Normalize inputs
     if country and (not region or region == "ALL"): region = country
+    search_is_active = bool(search and search.strip())
     
+    # Global Search: search across ALL countries and ALL categories
+    if search_is_active:
+        region = "ALL"
+        category = "ALL"
+
     # Generate base cache key (GLOBAL - shared across all users with same filters)
     base_cache_key = product_list_cache.get_base_cache_key(region, category, search or "")
     
@@ -2279,9 +2411,19 @@ async def get_feed(
         if cached_data is not None:
             all_products, next_sql_offset, db_end_reached = cached_data
             
-            # Check if requested page is already in research OR if DB is fully exhausted
-            # If we have enough products to satisfy the offset+limit, OR we know there's no more in DB, return hit
-            if (offset + limit <= len(all_products)) or db_end_reached:
+            # If search is active and user scrolled to/past end of current cache while background scan is in-flight:
+            if search_is_active and (offset + limit > len(all_products)) and (base_cache_key in ACTIVE_BACKGROUND_SEARCHES):
+                for _ in range(15):
+                    await asyncio.sleep(0.1)
+                    c_data = product_list_cache.get(base_cache_key)
+                    if c_data:
+                        all_products, next_sql_offset, db_end_reached = c_data
+                        if (offset + limit <= len(all_products)) or (base_cache_key not in ACTIVE_BACKGROUND_SEARCHES):
+                            break
+
+            # Check if requested page is already in reach OR if DB is fully exhausted OR if in search mode
+            # In search mode, all matches are in cache — we never do a slow DB refill on search pagination.
+            if search_is_active or (offset + limit <= len(all_products)) or db_end_reached:
                 print(f"[FEED CACHE] OK - Serving page from {len(all_products)} cached products")
                 
                 # Check premium status
@@ -2289,7 +2431,13 @@ async def get_feed(
                 
                 # Slice for requested page
                 page_products = all_products[offset:offset+limit]
-                has_more = (offset + limit) < len(all_products) or (not db_end_reached)
+                if search_is_active:
+                    bg_still_active = base_cache_key in ACTIVE_BACKGROUND_SEARCHES
+                    has_more = (offset + limit < len(all_products)) or bg_still_active or (not db_end_reached)
+                    if len(page_products) == 0 and not bg_still_active:
+                        has_more = False
+                else:
+                    has_more = len(page_products) > 0 and ((offset + limit) < len(all_products) or not db_end_reached)
                 
                 # Apply free user limits
                 if not premium_user:
@@ -2304,7 +2452,7 @@ async def get_feed(
                     "next_offset": offset + limit if has_more else offset + len(page_products),
                     "has_more": has_more,
                     "is_premium": premium_user,
-                    "total_count": len(all_products) if db_end_reached else len(all_products) + 100
+                    "total_count": len(all_products) if (db_end_reached and not (base_cache_key in ACTIVE_BACKGROUND_SEARCHES)) else len(all_products) + 100
                 }
             else:
                 # AUTO-REFILL: We have some products, but user scrolled past them.
@@ -2357,9 +2505,9 @@ async def get_feed(
         search_start_time = time.time()
         if search_is_active:
             batch_limit = 200
-            cache_fill_target = 30
-            max_chunks = 6  # Scans up to 1,200 recent messages
-            max_search_duration = 3.5  # Max 3.5 seconds to guarantee response before any mobile timeout
+            cache_fill_target = 10     # Stop fast once we have enough for the first page
+            max_chunks = 4             # Scans up to 800 recent messages initially
+            max_search_duration = 1.8  # Max 1.8s so first page renders FAST
         else:
             base_max = 100 if premium_user else 30
             max_chunks = base_max
@@ -2373,8 +2521,8 @@ async def get_feed(
         db_end_reached = False
         logo_filter_cids = await get_logo_filter_channel_ids()
         while len(all_products) < cache_fill_target and chunks_scanned < max_chunks:
-            # Time budget guard: return immediately if search duration exceeds budget and we found matches
-            if search_is_active and (time.time() - search_start_time) > max_search_duration and all_products:
+            # Time budget guard: return immediately if search duration exceeds budget
+            if search_is_active and (time.time() - search_start_time) > max_search_duration:
                 break
 
             query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}"
@@ -2471,13 +2619,38 @@ async def get_feed(
                 print(f"[FEED] Error in batch fetch: {e}")
                 break
     
-        # Update cache with the potentially larger list
+        # Update cache with initial results
         product_list_cache.set(base_cache_key, all_products, current_sql_offset, db_end_reached)
+        
+        # Start background deep search to progressively stream in deeper results if end not reached!
+        if search_is_active and not db_end_reached and base_cache_key not in ACTIVE_BACKGROUND_SEARCHES:
+            if len(ACTIVE_BACKGROUND_SEARCHES) >= 3:
+                oldest_key = next(iter(ACTIVE_BACKGROUND_SEARCHES))
+                old_t = ACTIVE_BACKGROUND_SEARCHES.pop(oldest_key, None)
+                if old_t and not old_t.done():
+                    old_t.cancel()
+                    
+            task = asyncio.create_task(
+                async_deep_search_worker(
+                    search_query=search,
+                    base_cache_key=base_cache_key,
+                    start_sql_offset=current_sql_offset,
+                    channel_map=channel_map,
+                    logo_filter_cids=logo_filter_cids
+                )
+            )
+            ACTIVE_BACKGROUND_SEARCHES[base_cache_key] = task
         
         # Slice and return
         total_found = len(all_products)
         page_products = all_products[offset:offset+limit]
-        has_more = (offset + limit) < total_found or (not db_end_reached)
+        if search_is_active:
+            bg_still_active = base_cache_key in ACTIVE_BACKGROUND_SEARCHES
+            has_more = (offset + limit < total_found) or bg_still_active or (not db_end_reached)
+            if len(page_products) == 0 and not bg_still_active:
+                has_more = False
+        else:
+            has_more = len(page_products) > 0 and ((offset + limit) < total_found or not db_end_reached)
         
         if not premium_user:
             if len(page_products) > 4:
@@ -2490,7 +2663,7 @@ async def get_feed(
             "next_offset": offset + limit if has_more else offset + len(page_products), 
             "has_more": has_more, 
             "is_premium": premium_user, 
-            "total_count": total_found if db_end_reached else total_found + 100
+            "total_count": total_found if (db_end_reached and not (base_cache_key in ACTIVE_BACKGROUND_SEARCHES)) else total_found + 100
         }
         
         print(f"[FEED] Complete. Found {total_found} products (scanned up to SQL offset {current_sql_offset}). Returning {len(page_products)} @ offset {offset}.")
