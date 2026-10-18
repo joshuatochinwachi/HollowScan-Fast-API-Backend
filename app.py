@@ -212,7 +212,8 @@ def is_valid_product_image(url: Optional[str]) -> bool:
     return True
 
 
-RESOLVED_IMAGE_CACHE = {}
+RESOLVED_IMAGE_CACHE: Dict[str, str] = {}
+ENRICHMENT_ATTEMPTED_MSG_IDS: set = set()
 
 
 def scrape_og_image_regex(html_text: str) -> Optional[str]:
@@ -238,16 +239,18 @@ def scrape_og_image_regex(html_text: str) -> Optional[str]:
 async def async_enrich_product_image(msg_id: str, candidate_urls: list):
     """Background worker: tries candidate URLs in order, scrapes og:image, patches Supabase."""
     if not candidate_urls or not msg_id:
-        print(f"[IMAGE ENRICH] SKIP {msg_id}: no candidate URLs provided")
         return
+
+    msg_id_str = str(msg_id)
+    ENRICHMENT_ATTEMPTED_MSG_IDS.add(msg_id_str)
+    if len(ENRICHMENT_ATTEMPTED_MSG_IDS) > 5000:
+        ENRICHMENT_ATTEMPTED_MSG_IDS.clear()
+
     skip_patterns = ['keepa.com', 'ebay.com/sch', 'login', 'cart', 'checkout', 'bugs.zephr', '/member/']
-    attempted = []
     for buy_url in candidate_urls:
         if not buy_url or not isinstance(buy_url, str) or not buy_url.startswith("http"):
-            print(f"[IMAGE ENRICH] SKIP {msg_id}: invalid/empty URL -> {repr(buy_url)[:80]}")
             continue
         if any(x in buy_url.lower() for x in skip_patterns):
-            print(f"[IMAGE ENRICH] SKIP {msg_id}: URL matched skip pattern -> {buy_url[:80]}")
             continue
         try:
             clean_url = buy_url
@@ -260,30 +263,26 @@ async def async_enrich_product_image(msg_id: str, candidate_urls: list):
                     if not target.startswith('http'): target = 'https://' + target.lstrip('/')
                     clean_url = target
             if any(x in clean_url.lower() for x in skip_patterns):
-                print(f"[IMAGE ENRICH] SKIP {msg_id}: unwrapped URL matched skip pattern -> {clean_url[:80]}")
                 continue
-            attempted.append(clean_url[:80])
+
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             }
-            resp = await http_client.get(clean_url, headers=headers, timeout=8.0, follow_redirects=True)
+            resp = await http_client.get(clean_url, headers=headers, timeout=5.0, follow_redirects=True)
             if resp.status_code != 200:
-                print(f"[IMAGE ENRICH] HTTP {resp.status_code} for {msg_id} -> {clean_url[:80]}")
                 continue
             found_img = scrape_og_image_regex(resp.text)
-            if not found_img:
-                print(f"[IMAGE ENRICH] NO OG TAG for {msg_id} -> {clean_url[:80]} (page len={len(resp.text)})")
+            if not found_img or not is_valid_product_image(found_img):
                 continue
-            if not is_valid_product_image(found_img):
-                print(f"[IMAGE ENRICH] INVALID IMAGE for {msg_id} -> scraped={found_img[:80]}")
-                continue
+
             found_img = optimize_image_url(found_img)
             RESOLVED_IMAGE_CACHE[buy_url] = found_img
             RESOLVED_IMAGE_CACHE[clean_url] = found_img
+            RESOLVED_IMAGE_CACHE[msg_id_str] = found_img
+
             get_res = await http_client.get(f"{URL}/rest/v1/discord_messages?id=eq.{msg_id}&select=raw_data", headers=HEADERS)
             if get_res.status_code != 200 or not get_res.json():
-                print(f"[IMAGE ENRICH] DB FETCH FAIL for {msg_id}: HTTP {get_res.status_code}")
                 return
             raw_d = get_res.json()[0].get("raw_data") or {}
             if "embed" not in raw_d or not isinstance(raw_d["embed"], dict):
@@ -297,22 +296,11 @@ async def async_enrich_product_image(msg_id: str, candidate_urls: list):
                 headers=HEADERS,
                 json={"raw_data": raw_d}
             )
-            if patch_res.status_code not in [200, 201, 204]:
-                print(f"[IMAGE ENRICH] DB PATCH FAIL for {msg_id}: HTTP {patch_res.status_code} {patch_res.text[:100]}")
-                return
-            print(f"[IMAGE ENRICH] OK Patched {msg_id} with scraped image from {clean_url[:50]}: {found_img[:60]}")
-            # Bust the feed cache so this product is re-fetched from DB with the new image
-            try:
-                product_list_cache.invalidate(None)
-                print(f"[IMAGE ENRICH] Feed cache busted after enriching {msg_id}")
-            except Exception as cache_err:
-                print(f"[IMAGE ENRICH] Cache bust failed: {cache_err}")
+            if patch_res.status_code in [200, 201, 204]:
+                print(f"[IMAGE ENRICH] ✅ Enriched image for msg {msg_id}: {found_img[:60]}")
             return  # Success — stop trying further URLs
-        except Exception as e:
-            print(f"[IMAGE ENRICH] EXCEPTION for {msg_id} / {buy_url[:50]}: {type(e).__name__}: {e}")
+        except Exception:
             continue
-    # All URLs exhausted without finding an image
-    print(f"[IMAGE ENRICH] EXHAUSTED {msg_id}: tried {len(attempted)} URL(s) with no result -> {attempted}")
 
 
 def db_retry(retries: int = 5, backoff: float = 1.0):
@@ -1979,15 +1967,13 @@ def extract_product(msg, channel_map):
              link_match = re.search(r'\[([^\]]+)\]\((https?://[^\)]+)\)', field.get("value", ""))
              if link_match: primary_buy_url = link_match.group(2); break
 
-    if not image and primary_buy_url:
-        cached_img = RESOLVED_IMAGE_CACHE.get(primary_buy_url)
+    if not image:
+        msg_id_key = str(msg.get("id", ""))
+        cached_img = RESOLVED_IMAGE_CACHE.get(msg_id_key) or (RESOLVED_IMAGE_CACHE.get(primary_buy_url) if primary_buy_url else None)
         if cached_img and is_valid_product_image(cached_img):
             image = cached_img
 
     if not is_valid_product_image(image):
-        msg_id_log = str(msg.get("id", "?"))
-        has_embed_imgs = bool(embed.get("images") or embed.get("image") or embed.get("thumbnail"))
-        print(f"[IMAGE MISSING] msg={msg_id_log} title={title[:40]!r} embed_has_imgs={has_embed_imgs} raw_image_val={repr(image)[:80]}")
         final_image = "https://via.placeholder.com/400"
     else:
         final_image = image
@@ -2368,10 +2354,12 @@ async def get_feed(
                     seen_signatures.add(p["content_signature"])
         
         chunks_scanned = 0
+        search_start_time = time.time()
         if search_is_active:
-            batch_limit = 500
-            cache_fill_target = 60
-            max_chunks = 10  # Scans up to 5,000 recent messages
+            batch_limit = 200
+            cache_fill_target = 30
+            max_chunks = 6  # Scans up to 1,200 recent messages
+            max_search_duration = 3.5  # Max 3.5 seconds to guarantee response before any mobile timeout
         else:
             base_max = 100 if premium_user else 30
             max_chunks = base_max
@@ -2380,10 +2368,15 @@ async def get_feed(
                 cache_fill_target = len(all_products) + 50 # Add a small batch on refill
             else:
                 cache_fill_target = 100
+            max_search_duration = 999.0
         
         db_end_reached = False
         logo_filter_cids = await get_logo_filter_channel_ids()
         while len(all_products) < cache_fill_target and chunks_scanned < max_chunks:
+            # Time budget guard: return immediately if search duration exceeds budget and we found matches
+            if search_is_active and (time.time() - search_start_time) > max_search_duration and all_products:
+                break
+
             query = f"order=scraped_at.desc&offset={current_sql_offset}&limit={batch_limit}"
             if id_filter and not search_is_active: query += id_filter
                     
@@ -2425,10 +2418,11 @@ async def get_feed(
                     if not (has_image or has_any_price or has_links): continue
 
                     # Background: scrape image from product page if missing
-                    if not has_image:
+                    # GUARD: NEVER enrich non-matching items during search; throttle to max 5 concurrent tasks
+                    if not has_image and not search_is_active:
                         msg_id_str = str(msg.get("id"))
-                        if msg_id_str not in RESOLVED_IMAGE_CACHE:
-                            # Build candidate URL list: title_url first, then buy, then others
+                        if msg_id_str not in RESOLVED_IMAGE_CACHE and msg_id_str not in ENRICHMENT_ATTEMPTED_MSG_IDS:
+                            ENRICHMENT_ATTEMPTED_MSG_IDS.add(msg_id_str)
                             raw_for_enrich = msg.get("raw_data", {})
                             embed_for_enrich = raw_for_enrich.get("embed") or (raw_for_enrich.get("embeds") or [{}])[0]
                             candidate_urls = []
@@ -2438,7 +2432,7 @@ async def get_feed(
                                 for lnk in (link_cat or []):
                                     u = lnk.get("url") if isinstance(lnk, dict) else lnk
                                     if u and u not in candidate_urls: candidate_urls.append(u)
-                            if candidate_urls:
+                            if candidate_urls and len(background_tasks.tasks) < 5:
                                 background_tasks.add_task(async_enrich_product_image, msg_id_str, candidate_urls)
                     
                     if search_is_active:
@@ -2447,6 +2441,18 @@ async def get_feed(
                         search_blob = f"{p_data.get('title', '')} {p_data.get('description', '')} {prod.get('category_name', '')} {prod.get('region', '')} {msg.get('content', '')} {details_str}".lower()
                         if not all(kw in search_blob for kw in search_keywords):
                             continue
+                        # If a matching search result has no image, queue enrichment just for this matching item (max 2)
+                        if not has_image and len(background_tasks.tasks) < 3:
+                            msg_id_str = str(msg.get("id"))
+                            if msg_id_str not in RESOLVED_IMAGE_CACHE and msg_id_str not in ENRICHMENT_ATTEMPTED_MSG_IDS:
+                                ENRICHMENT_ATTEMPTED_MSG_IDS.add(msg_id_str)
+                                raw_for_enrich = msg.get("raw_data", {})
+                                embed_for_enrich = raw_for_enrich.get("embed") or (raw_for_enrich.get("embeds") or [{}])[0]
+                                candidate_urls = []
+                                if embed_for_enrich.get("title_url"): candidate_urls.append(embed_for_enrich["title_url"])
+                                if p_data.get("buy_url"): candidate_urls.append(p_data["buy_url"])
+                                if candidate_urls:
+                                    background_tasks.add_task(async_enrich_product_image, msg_id_str, candidate_urls)
     
                     if not search_is_active:
                         if region and region.strip().upper() != "ALL" and prod["region"].strip() != region.strip(): continue
