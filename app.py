@@ -160,7 +160,8 @@ def optimize_image_url(url: str) -> str:
         # ⚠️ DO NOT strip query params from cdn.discordapp.com or media.discordapp.net —
         # Discord now uses ephemeral signed URLs (?ex=...&is=...&hm=...) for attachments.
         # Stripping them causes 403 Forbidden, which triggers "Image Pending" in the mobile app.
-        # Only strip from the old images-ext proxy (handled above by unwrapping).
+        if "no_image.png" in url.lower():
+            return "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/no_image.png?v=2"
     except: pass
     return url
 
@@ -175,8 +176,8 @@ def is_valid_product_image(url: Optional[str]) -> bool:
     if u.startswith("data:image"):
         return False
     u_low = u.lower()
-    # HollowScan's official fallback image is explicitly valid
-    if "no_image.png" in u_low:
+    # HollowScan's official fallback image is explicitly valid (versioned or unversioned)
+    if "joshuatochinwachi" in u_low and "no_image.png" in u_low:
         return True
     # Block generic placeholder/no-image keyword patterns
     for bad in ["placeholder", "noimage", "no-image", "notfound", "comingsoon", "coming-soon", "unavailable", "no-photo", "image-not-available"]:
@@ -2084,7 +2085,7 @@ _BACKEND_RP_LOGO_URLS = [
     "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo.png",
     "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/RP_logo2.png",
 ]
-FALLBACK_IMAGE_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/no_image.png"
+FALLBACK_IMAGE_URL = "https://raw.githubusercontent.com/joshuatochinwachi/HollowScan-Mobile-App/main/public/no_image.png?v=2"
 
 _LOGO_FILTER_CHANNELS_CACHE: set = set()
 _LOGO_FILTER_LAST_FETCH: float = 0
